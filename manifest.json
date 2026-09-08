@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "tirade",
   "license": "MIT",
-  "description": "Next NYC subway arrivals for a station, live from the MTA's GTFS-realtime feed",
+  "description": "Live NYC subway arrivals for any station, straight from the MTA's GTFS-realtime feeds — no API key needed. Shows next arrivals in the bar and a full detail popup with whole-station multi-line tracking, search or browse by line, service alerts, a trip planner for direct and one-transfer routes, per-train stop-by-stop detail, and a “you are here” context strip for unfamiliar directions.",
   "kinds": [
     "bar-widget"
   ],
