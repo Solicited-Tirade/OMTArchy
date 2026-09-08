@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Find how to get from one subway station complex to another using live
+MTA GTFS-realtime data: a direct ride if one exists, else the best single
+transfer. Station-to-station only — no walking/driving directions.
+
+Usage:
+  nyc-subway-trip <originPairs> <destPairs> <transferPairs>
+
+  originPairs    "stopId:feedGroup,stopId:feedGroup,..." — every stop_id
+                 that's part of the origin complex (one per line grouping).
+  destPairs      same format, for the destination complex.
+  transferPairs  "entryStopId:entryFeed:exitStopId:exitFeed,..." — candidate
+                 one-transfer bridge points, each with the stop_id/feed
+                 reachable from the origin (entry) and the stop_id/feed
+                 that reaches the destination (exit). Computed by the caller
+                 from the static station dataset (Stations.js
+                 transferCandidates) — this script only confirms which
+                 candidates actually have a live connection right now.
+
+Prints {"direct": [...], "transfers": [...]} — both are lists, either or
+both may be empty, soonest first, capped at a handful of options each. Or
+{"error": "...", "detail": "..."} on failure.
+
+A single physical trip never crosses feed-group boundaries (each feed group
+is one physical division), so a direct connection is only possible between
+stop_ids that share a feed. That's also why a transfer's two legs are always
+each entirely on one feed.
+"""
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gtfs_realtime_pb2 as gtfs  # noqa: E402
+
+FEED_PATHS = {
+    "1234567S": "gtfs",
+    "ACE": "gtfs-ace",
+    "BDFM": "gtfs-bdfm",
+    "G": "gtfs-g",
+    "JZ": "gtfs-jz",
+    "NQRW": "gtfs-nqrw",
+    "L": "gtfs-l",
+    "SIR": "gtfs-si",
+}
+
+FEED_BASE = "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2F"
+
+MAX_RESULTS = 5
+TRANSFER_BUFFER_MINUTES = 2
+
+
+def fail(reason, detail=""):
+    print(json.dumps({"error": reason, "detail": str(detail)}))
+
+
+def parse_pairs(text):
+    """'stopId:feed,stopId:feed' -> [(stopId, feed), ...], deduped."""
+    out = []
+    seen = set()
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split(":")
+        if len(parts) != 2:
+            continue
+        pair = (parts[0], parts[1])
+        if pair in seen:
+            continue
+        seen.add(pair)
+        out.append(pair)
+    return out
+
+
+def parse_transfer_pairs(text):
+    """'entryStop:entryFeed:exitStop:exitFeed,...' -> list of 4-tuples."""
+    out = []
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.split(":")
+        if len(parts) != 4:
+            continue
+        out.append(tuple(parts))
+    return out
+
+
+def fetch_feed_trips(feed_group):
+    """Fetch + parse one feed group into a list of trips, each trip a list
+    of (parent_stop_id, dir_suffix, epoch_seconds) in visit order — the
+    ordering GTFS-realtime already guarantees per trip."""
+    path = FEED_PATHS.get(feed_group)
+    if not path:
+        return []
+    url = FEED_BASE + path
+    req = urllib.request.Request(url, headers={"User-Agent": "omarchy-nyc-subway-plugin/1.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        raw = resp.read()
+
+    feed = gtfs.FeedMessage()
+    feed.ParseFromString(raw)
+
+    trips = []
+    for entity in feed.entity:
+        if not entity.HasField("trip_update"):
+            continue
+        trip_update = entity.trip_update
+        route_id = trip_update.trip.route_id
+        stops = []
+        for stu in trip_update.stop_time_update:
+            sid = stu.stop_id
+            if not sid:
+                continue
+            if sid[-1] in ("N", "S"):
+                parent, dir_suffix = sid[:-1], sid[-1]
+            else:
+                parent, dir_suffix = sid, ""
+            when = None
+            if stu.HasField("arrival") and stu.arrival.time:
+                when = stu.arrival.time
+            elif stu.HasField("departure") and stu.departure.time:
+                when = stu.departure.time
+            if when is None:
+                continue
+            stops.append((parent, dir_suffix, when))
+        if stops:
+            trips.append({"route": route_id, "stops": stops})
+    return trips
+
+
+def find_direct(trips_by_feed, origin_stop, origin_feed, dest_stop, dest_feed, now):
+    """Every live trip that visits origin_stop before dest_stop on the same
+    feed, soonest first. A single trip only ever runs on one feed's
+    physical division, so cross-feed pairs can never connect directly."""
+    if origin_feed != dest_feed:
+        return []
+    trips = trips_by_feed.get(origin_feed, [])
+    results = []
+    for trip in trips:
+        origin_idx = None
+        dest_idx = None
+        for i, (parent, _dir, _when) in enumerate(trip["stops"]):
+            if parent == origin_stop and origin_idx is None:
+                origin_idx = i
+            elif parent == dest_stop and origin_idx is not None and dest_idx is None:
+                dest_idx = i
+                break
+        if origin_idx is None or dest_idx is None:
+            continue
+        depart_parent, depart_dir, depart_at = trip["stops"][origin_idx]
+        _arrive_parent, _arrive_dir, arrive_at = trip["stops"][dest_idx]
+        depart_minutes = (depart_at - now) / 60
+        arrive_minutes = (arrive_at - now) / 60
+        if depart_minutes < 0:
+            continue
+        results.append({
+            "route": trip["route"],
+            "dir": depart_dir,
+            "departStopId": origin_stop,
+            "departMinutes": round(depart_minutes),
+            "departAt": depart_at,
+            "arriveStopId": dest_stop,
+            "arriveMinutes": round(arrive_minutes),
+            "arriveAt": arrive_at,
+        })
+    results.sort(key=lambda r: r["arriveAt"])
+    return results[:MAX_RESULTS]
+
+
+def main():
+    args = sys.argv[1:]
+    origin_pairs = parse_pairs(args[0] if len(args) > 0 else "")
+    dest_pairs = parse_pairs(args[1] if len(args) > 1 else "")
+    transfer_pairs = parse_transfer_pairs(args[2] if len(args) > 2 else "")
+
+    if not origin_pairs or not dest_pairs:
+        return fail("no-stop-id")
+
+    needed_feeds = set()
+    for _stop, feed in origin_pairs:
+        needed_feeds.add(feed)
+    for _stop, feed in dest_pairs:
+        needed_feeds.add(feed)
+    for entry_stop, entry_feed, exit_stop, exit_feed in transfer_pairs:
+        needed_feeds.add(entry_feed)
+        needed_feeds.add(exit_feed)
+
+    trips_by_feed = {}
+    try:
+        for feed_group in needed_feeds:
+            trips_by_feed[feed_group] = fetch_feed_trips(feed_group)
+    except urllib.error.URLError as e:
+        return fail("fetch-failed", e)
+    except Exception as e:  # noqa: BLE001
+        return fail("parse-failed", e)
+
+    now = time.time()
+
+    direct = []
+    for origin_stop, origin_feed in origin_pairs:
+        for dest_stop, dest_feed in dest_pairs:
+            direct.extend(find_direct(trips_by_feed, origin_stop, origin_feed, dest_stop, dest_feed, now))
+    direct.sort(key=lambda r: r["arriveAt"])
+    direct = direct[:MAX_RESULTS]
+
+    transfers = []
+    if not direct:
+        for entry_stop, entry_feed, exit_stop, exit_feed in transfer_pairs:
+            leg1_options = []
+            for origin_stop, origin_feed in origin_pairs:
+                leg1_options.extend(find_direct(trips_by_feed, origin_stop, origin_feed, entry_stop, entry_feed, now))
+            if not leg1_options:
+                continue
+            leg1_options.sort(key=lambda r: r["arriveAt"])
+            best_leg1 = leg1_options[0]
+            earliest_leg2_depart = best_leg1["arriveAt"] + TRANSFER_BUFFER_MINUTES * 60
+
+            leg2_options = []
+            for dest_stop, dest_feed in dest_pairs:
+                leg2_options.extend(find_direct(trips_by_feed, exit_stop, exit_feed, dest_stop, dest_feed, now))
+            leg2_options = [o for o in leg2_options if o["departAt"] >= earliest_leg2_depart]
+            if not leg2_options:
+                continue
+            leg2_options.sort(key=lambda r: r["arriveAt"])
+            best_leg2 = leg2_options[0]
+
+            transfers.append({
+                "leg1": best_leg1,
+                "leg2": best_leg2,
+                "transferStopId": entry_stop,
+                "totalMinutes": best_leg2["arriveMinutes"],
+                "totalAt": best_leg2["arriveAt"],
+            })
+
+        transfers.sort(key=lambda t: t["totalAt"])
+        transfers = transfers[:2]
+
+    print(json.dumps({"direct": direct, "transfers": transfers}))
+
+
+if __name__ == "__main__":
+    main()

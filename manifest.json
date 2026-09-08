@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "id": "tirade.nyc-subway",
+  "name": "OMTArchy - NYC Subway MTA",
+  "version": "1.0.0",
+  "author": "tirade",
+  "license": "MIT",
+  "description": "Next NYC subway arrivals for a station, live from the MTA's GTFS-realtime feed",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OMTArchy - NYC Subway MTA",
+    "description": "Next arrivals at a subway station, in the bar and in a detail popup. Tap \"Change\" in the popup to search or browse by line for a station.",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "feedGroup": "1234567S",
+      "stopId": "127",
+      "direction": "both",
+      "routeFilter": "",
+      "maxResults": 5,
+      "pollIntervalMs": 30000,
+      "label": ""
+    },
+    "schema": [
+      {
+        "key": "feedGroup",
+        "type": "enum",
+        "label": "Line group",
+        "options": ["1234567S", "ACE", "BDFM", "G", "JZ", "NQRW", "L", "SIR"],
+        "defaultValue": "1234567S",
+        "description": "Which MTA GTFS-realtime feed to poll. Set automatically when you pick a station with \"Change\" in the popup; only matters here if you're typing a Stop ID by hand below."
+      },
+      {
+        "key": "stopId",
+        "type": "string",
+        "label": "Stop ID",
+        "defaultValue": "127",
+        "description": "GTFS stop_id for the station. Normally set for you by the in-popup station picker (search by name or browse by line) — this field is a manual fallback for a stop_id the picker doesn't have. Can be a comma-separated list of stop_ids sharing one feed, to track a whole multi-line complex (e.g. Grand Central's 4/5/6, 7, and S platforms) as a single board — set automatically when you click a station row instead of one of its line pills."
+      },
+      {
+        "key": "direction",
+        "type": "enum",
+        "label": "Direction",
+        "options": ["both", "N", "S"],
+        "defaultValue": "both",
+        "description": "both shows an Uptown/Downtown toggle in the popup. N or S locks the popup to just that direction (N = uptown/northbound, S = downtown/southbound)."
+      },
+      {
+        "key": "routeFilter",
+        "type": "string",
+        "label": "Routes (optional)",
+        "defaultValue": "",
+        "description": "Comma-separated route IDs to fetch, e.g. 1,2,3. Blank fetches every route serving this stop; tap a route's pill in the popup to focus on just that line."
+      },
+      {
+        "key": "maxResults",
+        "type": "integer",
+        "label": "Arrivals shown",
+        "min": 1,
+        "max": 10,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "How many upcoming trains to list for the selected direction/route."
+      },
+      {
+        "key": "pollIntervalMs",
+        "type": "integer",
+        "label": "Refresh interval (ms)",
+        "min": 10000,
+        "max": 120000,
+        "step": 5000,
+        "defaultValue": 30000,
+        "description": "MTA feeds update roughly every 30s; polling faster than that just burns CPU."
+      },
+      {
+        "key": "label",
+        "type": "string",
+        "label": "Bar label override",
+        "defaultValue": "",
+        "description": "Short name shown in the bar, e.g. Times Sq. Defaults to the stop ID."
+      }
+    ],
+    "aliases": [
+      "mta",
+      "subway",
+      "train",
+      "transit"
+    ]
+  }
+}
