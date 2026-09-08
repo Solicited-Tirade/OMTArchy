@@ -44,7 +44,7 @@ An [Omarchy](https://omarchy.org/) bar widget showing live NYC subway arrivals f
 ## Installation
 
 ```
-omarchy plugin add https://github.com/<your-username>/<repo-name>.git --enable
+omarchy plugin add https://github.com/Solicited-Tirade/OMTArchy.git --enable
 ```
 
 Then set a station via the widget's settings, or open the popup and use "Change" to search by name or browse by line.
