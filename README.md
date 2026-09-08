@@ -41,6 +41,10 @@ An [Omarchy](https://omarchy.org/) bar widget showing live NYC subway arrivals f
 
 ![Trip planner](docs/Trip.png)
 
+## Requirements
+
+- Python 3 with the `protobuf` package (`python-protobuf` on Arch) — used to decode MTA's GTFS-realtime feed.
+
 ## Installation
 
 ```
@@ -48,6 +52,12 @@ omarchy plugin add https://github.com/Solicited-Tirade/OMTArchy.git --enable
 ```
 
 Then set a station via the widget's settings, or open the popup and use "Change" to search by name or browse by line.
+
+To remove it later:
+
+```
+omarchy plugin remove tirade.nyc-subway
+```
 
 ## Configuration
 
