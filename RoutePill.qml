@@ -3,7 +3,8 @@ import qs.Commons
 import "Model.js" as Model
 
 // Circular route badge: MTA line color fill, bold route letter/number
-// label. Covers this plugin's static (non-interactive) route badges — the
+// label (or, deselected in the arrivals board's line selector, an outline
+// ring). Covers this plugin's static (non-interactive) route badges — the
 // arrivals list, trip planner, trip detail header, and the all-routes
 // "which lines serve this stop" row, including that row's "not currently
 // running" blink (crossfades to a warning glyph on blinkPhase rather than
@@ -26,30 +27,41 @@ Rectangle {
   // which of the two faces is currently showing.
   property bool running: true
   property bool blinkPhase: false
+  // The arrivals board's line selector: an unselected line draws as an
+  // outline ring in its color, and hoverMark ("+"/"−") replaces the label
+  // while the pointer is over it, on a solid fill, to say what a click does.
+  property bool selected: true
+  property string hoverMark: ""
+  readonly property bool solid: selected || hoverMark !== ""
 
   width: diameter
   height: diameter
   radius: width / 2
-  color: route === "" ? emptyColor : Model.routeColor(route)
-  opacity: running ? 1.0 : 0.55
+  color: route === "" ? emptyColor : (solid ? Model.routeColor(route) : "transparent")
+  border.width: solid ? 0 : Math.max(1, Math.round(diameter / 12))
+  border.color: Model.routeColor(route)
+  opacity: running || !selected ? 1.0 : 0.55
+  antialiasing: true
+
+  Behavior on color { ColorAnimation { duration: 100 } }
 
   Text {
     textFormat: Text.PlainText
     anchors.centerIn: parent
-    visible: pill.route !== ""
+    visible: pill.route !== "" && pill.hoverMark === ""
     text: pill.route
-    color: Model.routeTextColor(pill.route)
+    color: pill.solid ? Model.routeTextColor(pill.route) : Model.routeColor(pill.route)
     font.family: pill.labelFontFamily
     font.pixelSize: pill.labelPixelSize
     font.bold: true
-    opacity: pill.running || !pill.blinkPhase ? 1.0 : 0.0
+    opacity: pill.running || !pill.selected || !pill.blinkPhase ? 1.0 : 0.0
     Behavior on opacity { NumberAnimation { duration: 500; easing.type: Easing.InOutQuad } }
   }
 
   Text {
     textFormat: Text.PlainText
     anchors.centerIn: parent
-    visible: pill.route !== "" && !pill.running
+    visible: pill.route !== "" && !pill.running && pill.selected && pill.hoverMark === ""
     text: "⚠"
     color: Model.routeTextColor(pill.route)
     font.family: pill.labelFontFamily
@@ -57,5 +69,16 @@ Rectangle {
     font.bold: true
     opacity: !pill.running && pill.blinkPhase ? 1.0 : 0.0
     Behavior on opacity { NumberAnimation { duration: 500; easing.type: Easing.InOutQuad } }
+  }
+
+  Text {
+    textFormat: Text.PlainText
+    anchors.centerIn: parent
+    visible: pill.hoverMark !== ""
+    text: pill.hoverMark
+    color: Model.routeTextColor(pill.route)
+    font.family: pill.labelFontFamily
+    font.pixelSize: pill.labelPixelSize + 4
+    font.bold: true
   }
 }

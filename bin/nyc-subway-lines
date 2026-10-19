@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""System-wide line status — the "is the whole system OK?" view: every
+subway line, how many of its trains are running right now, and its active
+alerts, as JSON.
+
+Usage: nyc-subway-lines
+
+Prints {"lines": [{"route","routeId","label","feed","trains","status",
+"alerts": [{"header","kind","period"}, ...]}, ...]}, or {"error": "..."}.
+status is the worst thing going on: "delays" (any live problem),
+"planned" (only planned work), "good", or "none" (no trains in the feed —
+not running right now, e.g. the B at night, or the feed is down).
+
+Fetches all eight subway feeds in parallel, plus the (cached) alerts feed,
+so it's meant to run only while the Lines view is open.
+"""
+import json
+import time
+import urllib.error
+
+import mta_feed
+
+ALERTS_CACHE_SECONDS = 120
+
+# Every line, in MTA service-group order. The three shuttles are separate
+# rows here: they're unrelated lines that only share the "S" bullet.
+LINES = [
+    ("1", "1234567S", ""), ("2", "1234567S", ""), ("3", "1234567S", ""),
+    ("4", "1234567S", ""), ("5", "1234567S", ""), ("6", "1234567S", ""),
+    ("7", "1234567S", ""), ("GS", "1234567S", "42 St Shuttle"),
+    ("A", "ACE", ""), ("C", "ACE", ""), ("E", "ACE", ""), ("H", "ACE", "Rockaway Park Shuttle"),
+    ("B", "BDFM", ""), ("D", "BDFM", ""), ("F", "BDFM", ""), ("M", "BDFM", ""), ("FS", "BDFM", "Franklin Av Shuttle"),
+    ("G", "G", ""),
+    ("J", "JZ", ""), ("Z", "JZ", ""),
+    ("N", "NQRW", ""), ("Q", "NQRW", ""), ("R", "NQRW", ""), ("W", "NQRW", ""),
+    ("L", "L", ""),
+    ("SI", "SIR", "Staten Island Railway"),
+]
+
+KIND_ORDER = {"delay": 0, "notice": 1, "planned": 2}
+# Same split as nyc-subway-status's alert_kind.
+NOTICE_TYPES = {"Station Notice", "Boarding Change", "Special Schedule", "Extra Service", "Special Event"}
+
+
+def alert_kind(alert_type):
+    if alert_type.startswith("Planned"):
+        return "planned"
+    if alert_type in NOTICE_TYPES:
+        return "notice"
+    return "delay"
+
+
+def alert_header(alert):
+    for translation in alert.header_text.translation:
+        if translation.language in ("en", ""):
+            return translation.text
+    return alert.header_text.translation[0].text if alert.header_text.translation else ""
+
+
+def alert_is_active(alert, now):
+    if not alert.active_period:
+        return True
+    return any((not p.start or p.start <= now) and (not p.end or p.end >= now) for p in alert.active_period)
+
+
+def main():
+    if mta_feed.IMPORT_ERROR is not None:
+        print(json.dumps({"error": "missing-protobuf", "detail": str(mta_feed.IMPORT_ERROR)}))
+        return
+
+    feeds = mta_feed.fetch_feeds(mta_feed.FEED_PATHS.keys())
+    if all(isinstance(f, Exception) for f in feeds.values()):
+        first = next(iter(feeds.values()))
+        reason = "fetch-failed" if isinstance(first, urllib.error.URLError) else "parse-failed"
+        print(json.dumps({"error": reason, "detail": str(first)}))
+        return
+
+    trains = {}
+    for feed in feeds.values():
+        if isinstance(feed, Exception):
+            continue
+        for entity in feed.entity:
+            # Assigned trains only: a schedule entry nobody's driving yet
+            # doesn't mean the line is running.
+            if entity.HasField("trip_update") and mta_feed.extension(entity.trip_update.trip).get(2, [0])[0] == 1:
+                route = entity.trip_update.trip.route_id
+                route = {"6X": "6", "7X": "7", "FX": "F"}.get(route, route)
+                trains[route] = trains.get(route, 0) + 1
+
+    alerts_by_route = {}
+    try:
+        alerts_feed = mta_feed.parse_feed(mta_feed.cached_bytes(mta_feed.ALERTS_URL, "subway-alerts.pb", ALERTS_CACHE_SECONDS))
+        now = time.time()
+        for entity in alerts_feed.entity:
+            if not entity.HasField("alert") or not alert_is_active(entity.alert, now):
+                continue
+            alert = entity.alert
+            header = alert_header(alert).strip()
+            if not header:
+                continue
+            mercury = mta_feed.extension(alert)
+            item = {
+                "header": header,
+                "kind": alert_kind(mta_feed.ext_text(mercury, 3)),
+                "period": mta_feed.ext_translated_text(mercury, 8),
+            }
+            routes = {ie.route_id for ie in alert.informed_entity if ie.route_id and ie.agency_id in ("", "MTASBWY")}
+            for route in {{"6X": "6", "7X": "7", "FX": "F"}.get(r, r) for r in routes}:
+                bucket = alerts_by_route.setdefault(route, [])
+                if all(a["header"] != header for a in bucket):
+                    bucket.append(item)
+    except Exception:  # noqa: BLE001 - statuses still useful without alerts
+        pass
+
+    lines = []
+    for route_id, feed_group, label in LINES:
+        alerts = sorted(alerts_by_route.get(route_id, []), key=lambda a: KIND_ORDER[a["kind"]])
+        count = trains.get(route_id, 0)
+        feed_ok = not isinstance(feeds.get(feed_group), Exception)
+        if any(a["kind"] == "delay" for a in alerts):
+            status = "delays"
+        elif count == 0:
+            status = "none" if feed_ok else "unknown"
+        elif any(a["kind"] == "planned" for a in alerts):
+            status = "planned"
+        else:
+            status = "good"
+        lines.append({
+            "route": mta_feed.display_route(route_id),
+            "routeId": route_id,
+            "label": label,
+            "feed": feed_group,
+            "trains": count,
+            "status": status,
+            "alerts": alerts[:6],
+        })
+
+    print(json.dumps({"lines": lines}))
+
+
+if __name__ == "__main__":
+    main()

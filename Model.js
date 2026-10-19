@@ -1,25 +1,20 @@
 // Pure data-shaping helpers for the NYC Subway widget. No QML dependency so
 // this can be unit tested with plain node/jest if desired.
 
-function shQuote(value) {
-  return "'" + String(value == null ? "" : value).replace(/'/g, "'\\''") + "'"
-}
-
-// Builds the bash -lc command line that runs the bundled helper script.
-// scriptPath is the absolute path to bin/nyc-subway-status (already resolved
-// from Qt.resolvedUrl by the caller). alertRoutes is typically every route
-// serving this stop — passing "" skips the alerts fetch entirely.
-function pollScript(scriptPath, feedGroup, stopId, direction, routeFilter, alertRoutes) {
-  return "python3 " + shQuote(scriptPath) + " "
-    + shQuote(feedGroup) + " "
-    + shQuote(stopId) + " "
-    + shQuote(direction) + " "
-    + shQuote(routeFilter) + " "
-    + shQuote(alertRoutes)
+// Builds the argv that runs the bundled helper script — exec'd directly, no
+// shell in between, so nothing needs quoting and no login profile runs on
+// every poll. scriptPath is the absolute path to bin/nyc-subway-status
+// (already resolved from Qt.resolvedUrl by the caller). alertRoutes is
+// typically every route serving this stop — passing "" skips the alerts
+// fetch entirely, as "" complexIds does for elevator/escalator outages.
+function pollCommand(scriptPath, feedGroup, stopId, direction, routeFilter, alertRoutes, complexIds, ride) {
+  return ["python3", String(scriptPath), String(feedGroup), String(stopId),
+    String(direction), String(routeFilter), String(alertRoutes), String(complexIds || ""), String(ride || "")]
 }
 
 // Parses the helper script's stdout. Returns
-// { ok: true, arrivals, alerts, generalAlerts } or { ok: false, error, detail }.
+// { ok: true, arrivals, alerts, generalAlerts, outages, feedTimestamp,
+// failedFeeds, ride } or { ok: false, error, detail }.
 // Never throws. `alerts` are specific to this station's routes; `generalAlerts`
 // are system-wide notices (holiday/weekend schedule, etc.) that name too many
 // routes to be about this particular stop — the caller decides where those
@@ -44,21 +39,64 @@ function parseArrivals(raw) {
     ok: true,
     arrivals: data.arrivals,
     alerts: Array.isArray(data.alerts) ? data.alerts : [],
-    generalAlerts: Array.isArray(data.generalAlerts) ? data.generalAlerts : []
+    generalAlerts: Array.isArray(data.generalAlerts) ? data.generalAlerts : [],
+    outages: Array.isArray(data.outages) ? data.outages : [],
+    feedTimestamp: Number(data.feedTimestamp) || 0,
+    failedFeeds: Array.isArray(data.failedFeeds) ? data.failedFeeds : [],
+    ride: data.ride || null
   }
 }
 
-// Builds the bash -lc command line for bin/nyc-subway-trip. originPairs and
+// Parses bin/nyc-subway-lines' stdout: { ok: true, lines } or
+// { ok: false, error, detail }. Never throws.
+function parseLines(raw) {
+  var text = String(raw || "").replace(/^\s+|\s+$/g, "")
+  if (text === "") return { ok: false, error: "empty", detail: "" }
+  var data
+  try {
+    data = JSON.parse(text)
+  } catch (e) {
+    return { ok: false, error: "bad-json", detail: text.slice(0, 200) }
+  }
+  if (data && data.error) return { ok: false, error: data.error, detail: data.detail || "" }
+  if (!data || !Array.isArray(data.lines)) return { ok: false, error: "bad-json", detail: "" }
+  return { ok: true, lines: data.lines }
+}
+
+// Short status label for the Lines view.
+function lineStatusText(line) {
+  switch (line.status) {
+    case "delays": return "Delays"
+    case "planned": return "Planned work"
+    case "good": return "Good service"
+    case "none": return "Not running now"
+    default: return "Unknown"
+  }
+}
+
+// "4 min late" for a train the helper matched against the timetable, or "".
+function delayPhrase(arrival) {
+  var d = arrival ? Number(arrival.delayMin) : NaN
+  return d > 0 ? d + " min late" : ""
+}
+
+// Bar text while riding: "⬆❹ → 59 St · 7m · 4 stops".
+function rideBarText(ride, alightName, nowSeconds) {
+  var minutes = Math.max(0, Math.round((Number(ride.alightEpoch) - nowSeconds) / 60))
+  var stops = Number(ride.stopsLeft)
+  return (ride.dir === "S" ? "⬇" : "⬆") + routeGlyph(ride.route) + " → " + truncateName(alightName, BAR_NAME_MAX_LENGTH)
+    + " · " + formatMinutes(minutes)
+    + (stops >= 0 ? " · " + (stops === 0 ? "next stop" : (stops + 1) + " stops") : "")
+}
+
+// Builds the argv for bin/nyc-subway-trip. originPairs and
 // destPairs are already-joined "stopId:feedGroup,..." strings (one entry per
 // line grouping at that station complex); transferPairs is an already-joined
 // "entryStop:entryFeed:exitStop:exitFeed,..." string of candidate one-
 // transfer bridge points — both built by the caller from
 // Stations.searchStationGroups / Stations.transferCandidates.
-function tripPollScript(scriptPath, originPairs, destPairs, transferPairs) {
-  return "python3 " + shQuote(scriptPath) + " "
-    + shQuote(originPairs) + " "
-    + shQuote(destPairs) + " "
-    + shQuote(transferPairs)
+function tripPollCommand(scriptPath, originPairs, destPairs, transferPairs) {
+  return ["python3", String(scriptPath), String(originPairs), String(destPairs), String(transferPairs)]
 }
 
 // Parses bin/nyc-subway-trip's stdout. Returns { ok: true, direct, transfers }
@@ -88,6 +126,19 @@ function parseTripResult(raw) {
 function formatMinutes(minutes) {
   var m = Math.max(0, Math.round(Number(minutes) || 0))
   return m === 0 ? "now" : (m + "m")
+}
+
+// formatMinutes for one arrival, with a leading "~" when no physical train
+// has been assigned to the trip yet (the helper's "assigned": false) — a
+// schedule entry that may not actually run, so the time is a guess.
+function formatCountdown(arrival) {
+  return (arrival && arrival.assigned === false ? "~" : "") + formatMinutes(arrival ? arrival.minutes : 0)
+}
+
+// "leave now" / "leave in 3m", for a walkMinutes-away station.
+function leavePhrase(minutes, walkMinutes) {
+  var lead = Math.round(Number(minutes) || 0) - Math.max(0, Number(walkMinutes) || 0)
+  return lead <= 0 ? "leave now" : ("leave in " + lead + "m")
 }
 
 // Sentence-fragment wrappers around formatMinutes for the trip planner,
@@ -143,7 +194,7 @@ var ROUTE_COLORS = {
   "L": "#A7A9AC",
   "N": "#FCCC0A", "Q": "#FCCC0A", "R": "#FCCC0A", "W": "#FCCC0A",
   "GS": "#808183", "FS": "#808183", "H": "#808183", "S": "#808183",
-  "SI": "#0039A6"
+  "SI": "#0039A6", "SIR": "#0039A6"
 }
 
 // Bullets on a light background (the yellow N/Q/R/W group) read better with
@@ -158,10 +209,10 @@ function routeTextColor(route) {
   return DARK_TEXT_ROUTES[String(route || "").toUpperCase()] ? "#1A1A1A" : "#FFFFFF"
 }
 
-// Typical terminal for a route + direction, used as a stand-in destination
-// label since the realtime feed doesn't carry a per-trip headsign. This is
-// the usual end of the line, not the live trip's actual destination — a
-// short-turning or rerouted train may end elsewhere.
+// Typical terminal for a route + direction — only a fallback now: the
+// helper reports each trip's real last stop (destStopId), which is what
+// Panel.qml shows when the bundled station data can name it. Keyed by the
+// live feed's route_id (GS/FS/H/SI), not the display route.
 var ROUTE_TERMINI = {
   "1": { N: "Van Cortlandt Park-242 St", S: "South Ferry" },
   "2": { N: "Wakefield-241 St", S: "Flatbush Av-Brooklyn College" },
@@ -189,7 +240,7 @@ var ROUTE_TERMINI = {
   "W": { N: "Astoria-Ditmars Blvd", S: "Whitehall St-South Ferry" },
   "GS": { N: "Times Sq-42 St", S: "Grand Central-42 St" },
   "FS": { N: "Franklin Av", S: "Prospect Park" },
-  "H": { N: "Rockaway Park-Beach 116 St", S: "Broad Channel" },
+  "H": { N: "Broad Channel", S: "Rockaway Park-Beach 116 St" },
   "SI": { N: "St George", S: "Tottenville" }
 }
 
@@ -214,6 +265,24 @@ function distinctRoutes(arrivals, compareRoutes) {
     if (an !== bn) return an ? -1 : 1
     return a < b ? -1 : (a > b ? 1 : 0)
   })
+  return out
+}
+
+// Arrivals with countdowns recomputed against nowSeconds, dropping trains
+// that have already left. The helper's own "minutes" is frozen at poll
+// time; without this the bar keeps saying "2m" for a train that left a
+// minute ago, and indefinitely so if the next poll fails.
+function liveArrivals(arrivals, nowSeconds) {
+  var out = []
+  for (var i = 0; i < (arrivals || []).length; i++) {
+    var a = arrivals[i]
+    var minutes = Math.round((Number(a.epoch) - nowSeconds) / 60)
+    if (minutes < 0) continue
+    var copy = {}
+    for (var k in a) copy[k] = a[k]
+    copy.minutes = minutes
+    out.push(copy)
+  }
   return out
 }
 
@@ -253,27 +322,25 @@ function circledGlyph(route) {
   return null
 }
 
-// Compact text for the bar pill: "<name> · ⚠3 · ⬆❻ · <minutes>" (the
-// "⚠<count> ·" segment only when alertCount > 0), or "⬆[SIR]" for the one
-// multi-character route code, which has no circled-glyph equivalent.
-// Every segment uses the same minimal " · " separator — including between
-// the route glyph and the countdown, and between the name and the alert
-// marker — so a route glyph directly against a countdown with no
-// separator (a bare "4 now") doesn't read as one unrelated pair of tokens.
-// The count sits directly against the glyph with no space
-// (matching the direction-arrow + route-glyph grouping, "⬆❻") so it reads
-// as one "how many alerts" unit rather than a second, disconnected number.
-// The alert marker sits right after the name (left side) rather than
-// trailing at the end, so it reads as "this station has N alerts" before
-// the specific train info, not as an afterthought tacked onto the
-// countdown. The circled glyph is what stands in for the popup's actual
-// colored route bullets here — no rich text/child shapes are possible in
-// this plain-text bar, so this is as close as a single character gets.
-// The heavy arrow is the same up/down direction concept as the
-// direction-tab arrow in the popup's context strip — ⬆ for uptown (N), ⬇
-// for downtown (S), chosen over the thinner ▲/▼ triangle for visibility
-// at small bar sizes. Empty string (widget hides itself) when there is
-// nothing to show yet.
+// Compact text for the bar pill:
+//
+//   "<name> · ⚠3 · ⬆❹ · 2m, 6m, ❺ 9m · leave in 1m"
+//
+// - "⚠<count> ·" only when alertCount > 0, right after the name, so it
+//   reads as "this station has N problems" before the train info. The count
+//   sits against the glyph with no space so it reads as one unit.
+// - The heavy arrow is the selected direction (⬆ uptown/N, ⬇ downtown/S),
+//   chosen over ▲/▼ for visibility at bar sizes; the circled glyph stands in
+//   for the popup's colored route bullet (no rich text or child shapes in
+//   this plain-text bar), with "[SIR]" for the one multi-character route.
+// - options.count (1-3) trains are listed; a later train repeats its route
+//   glyph only when it's a different line from the one before it.
+// - options.walkMinutes > 0 skips trains you can't make on foot any more and
+//   adds when to leave for the first one you can.
+// - "~" marks a scheduled trip with no train assigned yet (formatCountdown).
+// Every segment uses the same " · " separator, so a glyph never sits
+// directly against a countdown ("4 now") reading as one token.
+//
 // Bar-pill max name length before truncating with an ellipsis. Plenty of
 // real station names run past this — "Atlantic Av-Barclays Ctr" (25),
 // "Van Cortlandt Park-242 St" (26) — and left alone they'd balloon the
@@ -289,20 +356,38 @@ function truncateName(name, maxLength) {
   return n.slice(0, maxLength - 1) + "…"
 }
 
-function barText(stationLabel, stopId, arrivals, alertCount) {
+function routeGlyph(route) {
+  return circledGlyph(route) || ("[" + route + "]")
+}
+
+function barText(stationLabel, stopId, arrivals, alertCount, options) {
+  var opts = options || {}
+  var count = Math.min(3, Math.max(1, parseInt(opts.count, 10) || 1))
+  var walk = Math.max(0, Number(opts.walkMinutes) || 0)
   var name = truncateName(String(stationLabel || "").replace(/^\s+|\s+$/g, "") || String(stopId || ""), BAR_NAME_MAX_LENGTH)
-  var count = Math.max(0, Number(alertCount) || 0)
-  var prefix = name + (count > 0 ? " · ⚠" + count : "")
-  if (!arrivals || arrivals.length === 0) return prefix + " · —"
-  var next = arrivals[0]
-  var dirGlyph = next.dir === "S" ? "⬇" : "⬆"
-  var routeLabel = circledGlyph(next.route) || ("[" + next.route + "]")
-  return prefix + " · " + dirGlyph + routeLabel + " · " + formatMinutes(next.minutes)
+  var alerts = Math.max(0, Number(alertCount) || 0)
+  var prefix = name + (alerts > 0 ? " · ⚠" + alerts : "")
+
+  var trains = []
+  for (var i = 0; i < (arrivals || []).length && trains.length < count; i++) {
+    if (arrivals[i].minutes >= walk) trains.push(arrivals[i])
+  }
+  if (trains.length === 0) return prefix + " · —"
+
+  var first = trains[0]
+  var times = [formatCountdown(first)]
+  for (var j = 1; j < trains.length; j++) {
+    var sameRoute = trains[j].route === trains[j - 1].route
+    times.push((sameRoute ? "" : routeGlyph(trains[j].route) + " ") + formatCountdown(trains[j]))
+  }
+  var text = prefix + " · " + (first.dir === "S" ? "⬇" : "⬆") + routeGlyph(first.route) + " · " + times.join(", ")
+  return walk > 0 ? text + " · " + leavePhrase(first.minutes, walk) : text
 }
 
 function errorText(error) {
   switch (error) {
     case "no-stop-id": return "Set a Stop ID in this widget's settings"
+    case "missing-protobuf": return "Python protobuf is missing or too old — install python-protobuf"
     case "fetch-failed": return "Couldn't reach the MTA feed"
     case "parse-failed": return "Unexpected feed format"
     case "bad-json": return "Helper script output was not valid JSON"
@@ -321,12 +406,18 @@ function tripErrorText(error) {
 
 if (typeof module !== "undefined") {
   module.exports = {
-    shQuote: shQuote,
-    pollScript: pollScript,
+    pollCommand: pollCommand,
     parseArrivals: parseArrivals,
-    tripPollScript: tripPollScript,
+    parseLines: parseLines,
+    lineStatusText: lineStatusText,
+    delayPhrase: delayPhrase,
+    rideBarText: rideBarText,
+    tripPollCommand: tripPollCommand,
+    liveArrivals: liveArrivals,
     parseTripResult: parseTripResult,
     formatMinutes: formatMinutes,
+    formatCountdown: formatCountdown,
+    leavePhrase: leavePhrase,
     circledGlyph: circledGlyph,
     truncateName: truncateName,
     departPhrase: departPhrase,

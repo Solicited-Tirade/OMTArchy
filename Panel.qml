@@ -18,6 +18,7 @@ Panel {
 
   readonly property string helper: Qt.resolvedUrl("bin/nyc-subway-status").toString().replace(/^file:\/\//, "")
   readonly property string tripHelper: Qt.resolvedUrl("bin/nyc-subway-trip").toString().replace(/^file:\/\//, "")
+  readonly property string linesHelper: Qt.resolvedUrl("bin/nyc-subway-lines").toString().replace(/^file:\/\//, "")
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.5)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
@@ -29,6 +30,34 @@ Panel {
   readonly property int maxResults: Math.max(1, parseInt(setting("maxResults", 5), 10) || 5)
   readonly property int pollIntervalMs: Math.max(10000, parseInt(setting("pollIntervalMs", 30000), 10) || 30000)
   readonly property string labelOverride: String(setting("label", ""))
+  // Minutes on foot to the station. Trains closer than this are left out of
+  // the bar (you can't make them any more), which then also says when to
+  // leave, and the train-detail reminder fires this long before arrival.
+  readonly property int walkMinutes: Math.max(0, Math.min(60, parseInt(setting("walkMinutes", 0), 10) || 0))
+  readonly property int barArrivals: Math.max(1, Math.min(3, parseInt(setting("barArrivals", 2), 10) || 2))
+  // Commute presets: favorite stations (managed from the popup, stored in
+  // this widget's shell.json entry like everything else) can be tagged AM
+  // or PM, and with commuteAuto the widget switches to the AM one before
+  // commuteSwitchHour and the PM one after.
+  // Copied into a plain JS array: a list read back from shell.json arrives
+  // as a QML sequence, which fails Array.isArray and lacks .map/.filter.
+  readonly property var favorites: {
+    var f = setting("favorites", [])
+    if (!f || typeof f.length !== "number" || typeof f === "string") return []
+    var out = []
+    for (var i = 0; i < f.length; i++) if (f[i] && f[i].stopId) out.push(f[i])
+    return out
+  }
+  readonly property bool commuteAuto: setting("commuteAuto", false) === true
+  // Desktop notification when a new delay shows up for this station's
+  // selected lines: "off", "commute" (only while on the AM/PM commute
+  // favorite in commute mode), or "always".
+  readonly property string alertNotify: String(setting("alertNotify", "commute"))
+  readonly property int commuteSwitchHour: {
+    var h = parseInt(setting("commuteSwitchHour", 12), 10)
+    return isNaN(h) ? 12 : Math.max(0, Math.min(23, h))
+  }
+  readonly property var routeFilterList: root.routeFilter.split(",").map(function(r) { return r.trim() }).filter(function(r) { return r !== "" })
 
   // The bundled MTA station dataset, keyed by this exact stop_id, if the
   // configured stop came from (or matches) that dataset. A hand-typed stop_id
@@ -65,7 +94,13 @@ Panel {
   // changes (see resetForNewStation below).
   property bool approachExpanded: false
 
-  readonly property string stationLabel: labelOverride !== "" ? labelOverride : stopId
+  readonly property string stationLabel: labelOverride !== "" ? labelOverride : (selectedStation ? selectedStation.name : stopId)
+  // "Stop 631", or "5 platforms" for a whole-complex pick, whose raw stopId
+  // ("127:1234567S,725:1234567S,...") is no use to read.
+  readonly property string stopSummary: {
+    var ids = Stations.stopIdList(root.stopId)
+    return ids.length > 1 ? ids.length + " platforms" : "Stop " + (ids[0] || "")
+  }
 
   property var arrivals: []
   // Alerts specific to this station's routes. System-wide notices (holiday
@@ -74,6 +109,14 @@ Panel {
   // in the same list; see tooltipText for where they surface instead.
   property var alerts: []
   property var generalAlerts: []
+  // The arrivals feed's own header timestamp, i.e. when the MTA last
+  // published it. The MTA's feeds occasionally stall while still answering
+  // requests; this is how that (or our own polls failing) becomes visible.
+  property double feedTimestamp: 0
+  // Current elevator/escalator outages at this station complex.
+  property var outages: []
+  // Feeds of a multi-feed board that failed this poll (the rest still show).
+  property var failedFeeds: []
   property string lastError: ""
   property string lastErrorDetail: ""
   property bool loading: false
@@ -97,8 +140,27 @@ Panel {
   // More than 2 station alerts is enough to bury the arrivals list a
   // commuter actually opened this for, so beyond that they start collapsed
   // behind a count badge instead of full-size banners.
-  readonly property bool alertsNeedCollapse: alerts.length > 2
+  readonly property bool alertsNeedCollapse: liveAlerts.length > 2
   property bool alertsExpanded: false
+
+  // Planned work (weekend reroutes, skipped stops — the MTA's own
+  // "Planned - ..." alert types) is known days ahead and isn't why your
+  // train is late right now, so it's kept out of the bar's alert count and
+  // the main alert list, in its own collapsed section instead.
+  readonly property var liveAlerts: alerts.filter(function(a) { return a.kind !== "planned" })
+  readonly property var plannedAlerts: alerts.filter(function(a) { return a.kind === "planned" })
+  property bool plannedExpanded: false
+
+  property bool outagesExpanded: false
+  readonly property int elevatorOutageCount: outages.filter(function(o) { return o.type === "elevator" }).length
+  readonly property string outageSummary: {
+    var el = root.elevatorOutageCount
+    var es = root.outages.length - el
+    var parts = []
+    if (el > 0) parts.push(el + " elevator" + (el > 1 ? "s" : ""))
+    if (es > 0) parts.push(es + " escalator" + (es > 1 ? "s" : ""))
+    return parts.join(", ") + " out"
+  }
 
   // Routes with live arrivals right now, vs. every route that's actually
   // part of this station regardless of whether it's currently running.
@@ -114,6 +176,29 @@ Panel {
     return routes.length > 0 ? routes : root.availableRoutes
   }
 
+  // ---- Line selector: the route badges double as "which lines do I care
+  // about here" toggles. The selection is just routeFilter (blank = every
+  // line), so it persists per station, travels with favorites, and narrows
+  // the fetch, the alerts, and the bar too. It's also applied right here
+  // in the popup, so a toggle takes effect instantly rather than on the
+  // next poll.
+  function routeSelected(route) {
+    return root.routeFilterList.length === 0 || root.routeFilterList.indexOf(route) !== -1
+  }
+
+  function toggleRoute(route) {
+    var all = root.allStationRoutes
+    var selected = all.filter(root.routeSelected)
+    if (root.routeSelected(route)) {
+      if (selected.length <= 1) return // keep at least one line
+      selected = selected.filter(function(r) { return r !== route })
+    } else {
+      selected.push(route)
+    }
+    var everything = all.every(function(r) { return selected.indexOf(r) !== -1 })
+    persistSettings({ routeFilter: everything ? "" : all.filter(function(r) { return selected.indexOf(r) !== -1 }).join(",") })
+  }
+
   // Slow on/off blink driving the not-currently-running badges below,
   // toggling each between its route letter and a warning glyph. Only runs
   // while the popup is open — no reason to tick a timer against a hidden UI.
@@ -125,11 +210,18 @@ Panel {
     onTriggered: root.blinkPhase = !root.blinkPhase
   }
 
-  // Routes to check for active service alerts: the station's real route
-  // set when it's a known stop, else whatever the live feed is actually
-  // showing. A delay/reroute is often exactly why a route isn't showing up
-  // in arrivals at all, so this intentionally isn't limited to availableRoutes.
-  readonly property string alertRoutes: (selectedStation ? selectedStation.routes : root.availableRoutes).join(",")
+  // Routes to check for active service alerts: every route at the station
+  // (all platforms of a whole-complex pick, not just the primary one) when
+  // it's a known stop, else whatever the live feed is actually showing. A
+  // delay/reroute is often exactly why a route isn't showing up in arrivals
+  // at all, so this intentionally isn't limited to availableRoutes.
+  // Sent as "route@feed" tokens so the helper can tell the three "S"
+  // shuttles apart at a station spanning several feeds.
+  readonly property string alertRoutes: {
+    var tokens = Stations.alertRouteTokens(root.stopId, root.feedGroup, root.routeFilter)
+    return tokens !== "" ? tokens : root.availableRoutes.join(",")
+  }
+  readonly property string complexIds: Stations.complexIdsForStopId(root.stopId).join(",")
 
   // The direction toggle only makes sense when the feed actually carries
   // both directions; a station configured for one direction only shows that
@@ -145,7 +237,50 @@ Panel {
   // they can compare against a clock instead of doing that math themselves.
   property bool showClockTime: false
 
-  readonly property var visibleArrivals: Model.arrivalsFor(root.arrivals, root.selectedDirection, "", root.maxResults)
+  // Wall clock for the countdowns, ticking between polls so "4m" decays
+  // on its own instead of freezing at whatever the last poll said.
+  property double nowSeconds: Date.now() / 1000
+  Timer {
+    interval: 15000
+    running: true
+    repeat: true
+    onTriggered: {
+      root.nowSeconds = Date.now() / 1000
+      root.applyCommute()
+      // A ride whose arrival time is well past ends even if polls fail.
+      if (root.ride && root.nowSeconds > root.ride.alightEpoch + 180) root.endRide()
+    }
+  }
+
+  readonly property int feedAgeMinutes: root.feedTimestamp > 0 ? Math.max(0, Math.floor((root.nowSeconds - root.feedTimestamp) / 60)) : 0
+  readonly property bool feedStale: root.feedAgeMinutes >= 3
+
+  // Every live arrival on the selected lines in the selected direction,
+  // soonest first; the popup lists the first shownArrivals of them.
+  readonly property var directionArrivals: Model.arrivalsFor(
+    Model.liveArrivals(root.arrivals, root.nowSeconds).filter(function(a) { return root.routeSelected(a.route) }),
+    root.selectedDirection, "", 1000)
+
+  // "+5 more" / "+10 more" under the list grow it past maxResults for this
+  // look only; switching station or direction, or closing the popup, goes
+  // back to maxResults.
+  property int extraArrivals: 0
+  readonly property int shownArrivals: root.maxResults + root.extraArrivals
+  readonly property int hiddenArrivals: Math.max(0, root.directionArrivals.length - root.shownArrivals)
+  onSelectedDirectionChanged: root.extraArrivals = 0
+
+  readonly property var visibleArrivals: root.directionArrivals.slice(0, root.shownArrivals)
+
+  // Where this specific train actually ends (the helper reports each trip's
+  // last stop), falling back to the route's usual terminal for a stop the
+  // bundled data can't name. A trailing diamond marks the peak-direction
+  // <6>/<7>/<F> express, as on MTA signage.
+  function destinationName(train) {
+    if (!train) return ""
+    var dest = train.destStopId ? Stations.stationById(train.destStopId) : null
+    var name = dest ? dest.name : Model.destinationFor(train.routeId || train.route, train.dir)
+    return train.express ? name + " ◆" : name
+  }
 
   // visibleArrivals, not the raw arrivals list — the bar's "next train"
   // must match whatever the popup would actually show if opened right now
@@ -153,17 +288,31 @@ Panel {
   // Otherwise the bar can advertise a train (e.g. a soonest-overall
   // downtown arrival) that never appears in the list once you open it,
   // because you're looking at the Uptown tab.
-  readonly property string barLabel: stopId === "" ? "" : (" " + Model.barText(labelOverride, stopId, visibleArrivals, alerts.length))
+  // The bar draws from the whole selected direction, not just the
+  // maxResults rows the popup lists: with a walk time set, every one of
+  // those can be too soon to make at a busy station like Times Sq.
+  readonly property var barArrivalsSource: root.directionArrivals
+  readonly property string barLabel: stopId === "" ? "" : root.ride
+    ? " " + Model.rideBarText(root.ride, root.ride.alightName, root.nowSeconds)
+    : (" " + Model.barText(stationLabel, stopId, barArrivalsSource, liveAlerts.length,
+    { count: root.barArrivals, walkMinutes: root.walkMinutes }))
   // System-wide notices live here rather than in the popup body: a
   // "subways on a holiday schedule" banner isn't about this station, so it
   // gets a mention on hover instead of competing with the arrivals list
   // for space every time you open the popup.
   readonly property string tooltipText: stopId === ""
     ? "OMTArchy - NYC Subway MTA · set a Stop ID in this widget's settings"
-    : "OMTArchy - NYC Subway MTA · " + stationLabel
+    : "OMTArchy - NYC Subway MTA · "
+      + (ride ? "Riding the " + ride.route + " to " + ride.alightName + ", arriving " + Model.formatClockTime(ride.alightEpoch) + " · " : "")
+      + stationLabel
       + (visibleArrivals.length > 0 ? " · Next: " + Model.nextArrivalPhrase(visibleArrivals[0].route, visibleArrivals[0].minutes) : "")
       + (lastError !== "" ? " · " + Model.errorText(lastError) : "")
-      + (alerts.length > 0 ? " · " + alerts.length + " service alert" + (alerts.length > 1 ? "s" : "") : "")
+      + (feedStale ? " · MTA data " + feedAgeMinutes + "m old" : "")
+      + (liveAlerts.length > 0 ? " · " + liveAlerts.length + " service alert" + (liveAlerts.length > 1 ? "s" : "") : "")
+      + (plannedAlerts.length > 0 ? " · " + plannedAlerts.length + " planned work" : "")
+      + (elevatorOutageCount > 0 ? " · ♿ " + elevatorOutageCount + " elevator" + (elevatorOutageCount > 1 ? "s" : "") + " out" : "")
+      + (failedFeeds.length > 0 ? " · couldn't load " + failedFeeds.join(", ") : "")
+      + (leaveAlarm ? " · 🔔 reminder set for the " + leaveAlarm.route : "")
       + (generalAlerts.length > 0 ? " · " + generalAlerts[0].header : "")
 
   // ---- Legend: a static explainer for the UI language that's accumulated
@@ -226,10 +375,303 @@ Panel {
       root.bar.shell.updateEntryInline(root.moduleName, entry)
   }
 
+  // station.routeFilter narrows the board to one line (a line-bullet pick
+  // in the picker); a whole-station pick clears it.
   function pickStation(station) {
     if (!station) return
-    persistSettings({ stopId: station.id, feedGroup: station.feedGroup, label: station.name })
+    persistSettings({ stopId: station.id, feedGroup: station.feedGroup, label: station.name, routeFilter: station.routeFilter || "" })
     root.closePicker()
+  }
+
+  // ---- Favorites / commute presets.
+  function favoriteMatches(f) {
+    return !!f && f.stopId === root.stopId && String(f.routeFilter || "") === root.routeFilter
+  }
+  readonly property bool isFavorite: {
+    for (var i = 0; i < root.favorites.length; i++) if (root.favoriteMatches(root.favorites[i])) return true
+    return false
+  }
+  readonly property int maxFavorites: 6
+
+  function toggleFavorite() {
+    if (root.stopId === "") return
+    var next = []
+    var removed = false
+    for (var i = 0; i < root.favorites.length; i++) {
+      if (root.favoriteMatches(root.favorites[i])) removed = true
+      else next.push(root.favorites[i])
+    }
+    if (!removed) {
+      if (next.length >= root.maxFavorites) return
+      next.push({ stopId: root.stopId, feedGroup: root.feedGroup, label: root.stationLabel, routeFilter: root.routeFilter, role: "" })
+    }
+    persistSettings({ favorites: next })
+  }
+
+  // Right-click on a favorite cycles it through no role -> AM -> PM. Only
+  // one favorite holds each role at a time.
+  function cycleFavoriteRole(index) {
+    var order = ["", "am", "pm"]
+    var next = root.favorites.map(function(f) { var c = {}; for (var k in f) c[k] = f[k]; return c })
+    if (!next[index]) return
+    var role = order[(order.indexOf(next[index].role || "") + 1) % order.length]
+    for (var i = 0; i < next.length; i++) if (role !== "" && next[i].role === role) next[i].role = ""
+    next[index].role = role
+    persistSettings({ favorites: next })
+  }
+
+  function switchToFavorite(f) {
+    if (!f || root.favoriteMatches(f)) return
+    persistSettings({ stopId: f.stopId, feedGroup: f.feedGroup || root.feedGroup, label: f.label || "", routeFilter: f.routeFilter || "" })
+  }
+
+  // Switches only when the AM/PM period changes (and once at startup), so
+  // picking some other station by hand mid-morning sticks until the next
+  // switch time instead of being yanked back every tick.
+  property string lastCommutePeriod: ""
+  function applyCommute() {
+    if (!root.commuteAuto || !root.settings) return
+    var period = new Date().getHours() < root.commuteSwitchHour ? "am" : "pm"
+    if (period === root.lastCommutePeriod) return
+    root.lastCommutePeriod = period
+    for (var i = 0; i < root.favorites.length; i++) {
+      if (root.favorites[i].role === period) { root.switchToFavorite(root.favorites[i]); return }
+    }
+  }
+  onFavoritesChanged: applyCommute()
+  onCommuteAutoChanged: applyCommute()
+  onCommuteSwitchHourChanged: { root.lastCommutePeriod = ""; applyCommute() }
+
+  // ---- Leave reminder: a desktop notification for one specific train,
+  // walkMinutes before it reaches the station (or 2 minutes, with no walk
+  // time set). Tracks the train by trip id, so the reminder moves with it
+  // if it runs late, and survives closing the popup.
+  property var leaveAlarm: null
+  readonly property int leaveLeadSeconds: root.walkMinutes > 0 ? root.walkMinutes * 60 : 120
+
+  function alarmIsFor(train) {
+    return !!train && !!root.leaveAlarm && root.leaveAlarm.tripId === train.tripId && root.leaveAlarm.dir === train.dir
+  }
+
+  function setLeaveAlarm(train) {
+    if (!train || !train.tripId) return
+    root.leaveAlarm = {
+      tripId: train.tripId, route: train.route, dir: train.dir, epoch: train.epoch,
+      dest: root.destinationName(train), station: root.stationLabel
+    }
+    root.checkLeaveAlarm()
+  }
+
+  function cancelLeaveAlarm() {
+    root.leaveAlarm = null
+  }
+
+  function checkLeaveAlarm() {
+    var alarm = root.leaveAlarm
+    if (!alarm) return
+    var now = Date.now() / 1000
+    if (now > alarm.epoch + 60) { root.leaveAlarm = null; return } // that train's gone
+    if (now < alarm.epoch - root.leaveLeadSeconds) return
+    var mins = Math.max(0, Math.round((alarm.epoch - now) / 60))
+    var title = root.walkMinutes > 0 ? "Time to leave for the " + alarm.route : "The " + alarm.route + " is almost here"
+    var body = "To " + alarm.dest + " · reaches " + alarm.station + " " + (mins === 0 ? "now" : "in " + mins + "m")
+      + " (" + Model.formatClockTime(alarm.epoch) + ")"
+    root.notify(title, body, "critical")
+    root.leaveAlarm = null
+  }
+
+  Timer {
+    interval: 5000
+    running: !!root.leaveAlarm
+    repeat: true
+    onTriggered: root.checkLeaveAlarm()
+  }
+
+  // Desktop notifications go through one notify-send Process, queued so
+  // two at once (a reminder and a new alert) don't clobber each other.
+  property var notifyQueue: []
+  function notify(title, body, urgency) {
+    root.notifyQueue = root.notifyQueue.concat([["notify-send", "-a", "OMTArchy", "-u", urgency || "normal", title, body]])
+    root.pumpNotify()
+  }
+  function pumpNotify() {
+    if (notifyProc.running || root.notifyQueue.length === 0) return
+    notifyProc.command = root.notifyQueue[0]
+    root.notifyQueue = root.notifyQueue.slice(1)
+    notifyProc.running = true
+  }
+  Process {
+    id: notifyProc
+    onRunningChanged: if (!running) Qt.callLater(root.pumpNotify)
+  }
+
+  // ---- New-alert notifications. The first poll after switching station
+  // (or lines) only records what's already active, so turning the board to
+  // a new station never fires a burst of old alerts; after that, any live
+  // delay that wasn't there last time is announced once.
+  property var seenAlertHeaders: ({})
+  property string seenAlertsFor: ""
+  readonly property bool onCommuteStation: {
+    if (!root.commuteAuto) return false
+    var period = new Date(root.nowSeconds * 1000).getHours() < root.commuteSwitchHour ? "am" : "pm"
+    for (var i = 0; i < root.favorites.length; i++) {
+      if (root.favorites[i].role === period && root.favoriteMatches(root.favorites[i])) return true
+    }
+    return false
+  }
+
+  function notifyNewAlerts() {
+    var key = root.stopId + "|" + root.routeFilter
+    var fresh = root.seenAlertsFor !== key
+    var seen = fresh ? {} : root.seenAlertHeaders
+    var wanted = root.alertNotify === "always" || (root.alertNotify === "commute" && root.onCommuteStation)
+    for (var i = 0; i < root.liveAlerts.length; i++) {
+      var a = root.liveAlerts[i]
+      if (!fresh && wanted && a.kind === "delay" && !seen[a.header]) {
+        root.notify("Service alert" + (a.routes && a.routes.length ? ": " + a.routes.join(" ") : "") + " at " + root.stationLabel, a.header, "normal")
+      }
+      seen[a.header] = true
+    }
+    root.seenAlertHeaders = seen
+    root.seenAlertsFor = key
+  }
+
+  // ---- "I'm on this train": pick a train, then the stop you're getting off
+  // at, and the bar counts down to it; a notification fires when it's the
+  // next stop. Polled through the regular arrivals fetch (see rideToken),
+  // which keeps following the train after it leaves the tracked station.
+  property var ride: null
+  property bool ridePickMode: false
+  readonly property string rideToken: ride ? ride.feed + "|" + ride.tripId + "|" + ride.alightStopId : ""
+
+  function startRide(train, stopId, epoch) {
+    if (!train || !train.tripId || !train.feed) return
+    var station = Stations.stationById(stopId)
+    root.ride = {
+      tripId: train.tripId, feed: train.feed, route: train.route, dir: train.dir,
+      alightStopId: stopId, alightName: station ? station.name : stopId, alightEpoch: epoch,
+      stopsLeft: -1, notifiedNext: false, misses: 0
+    }
+    root.ridePickMode = false
+    root.closeTrainDetail()
+    root.refresh()
+  }
+
+  function endRide() {
+    root.ride = null
+    root.ridePickMode = false
+  }
+
+  // One poll's ride report (null = no ride, or its feed couldn't be
+  // checked this time — not evidence the train is gone).
+  function updateRide(info) {
+    if (!root.ride || !info) return
+    var next = {}
+    for (var k in root.ride) next[k] = root.ride[k]
+    if (info.found) {
+      next.alightEpoch = info.alightEpoch
+      next.stopsLeft = info.stopsLeft
+      next.misses = 0
+      if (info.stopsLeft === 0 && !next.notifiedNext) {
+        root.notify("Your stop is next: " + next.alightName,
+          "The " + next.route + " gets there at " + Model.formatClockTime(next.alightEpoch), "critical")
+        next.notifiedNext = true
+      }
+    } else {
+      next.misses = (next.misses || 0) + 1
+      // The trip leaves the feed once the train passes your stop (or the
+      // trip ends): two misses in a row, or a miss near arrival time, ends it.
+      if (next.misses >= 2 || root.nowSeconds > next.alightEpoch - 60) { root.endRide(); return }
+    }
+    root.ride = next
+  }
+
+  // ---- Lines view: system-wide status of every line (bin/nyc-subway-lines),
+  // polled only while it's open.
+  property bool linesOpen: false
+  property var lines: []
+  property bool linesLoading: false
+  property string linesError: ""
+  property string expandedLine: ""
+  readonly property int linesWithDelays: root.lines.filter(function(l) { return l.status === "delays" }).length
+  readonly property int linesNotRunning: root.lines.filter(function(l) { return l.status === "none" }).length
+
+  function openLines() {
+    root.linesOpen = true
+    root.runLinesQuery()
+  }
+
+  function closeLines() {
+    root.linesOpen = false
+  }
+
+  function runLinesQuery() {
+    if (linesProc.running) return
+    root.linesLoading = true
+    linesProc.command = ["python3", root.linesHelper]
+    linesProc.running = true
+  }
+
+  Process {
+    id: linesProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var parsed = Model.parseLines(text)
+        root.linesLoading = false
+        if (parsed.ok) {
+          root.lines = parsed.lines
+          root.linesError = ""
+        } else {
+          root.linesError = parsed.error
+        }
+      }
+    }
+  }
+
+  Timer {
+    interval: root.pollIntervalMs
+    running: root.linesOpen && root.opened
+    repeat: true
+    onTriggered: root.runLinesQuery()
+  }
+
+  // "2 stops away, at 51 St" / "Arriving next" / "At the platform" — where
+  // this train physically is, from its vehicle position. Nothing for a
+  // scheduled trip with no train assigned (it isn't anywhere yet).
+  function positionPhrase(train) {
+    if (!train || train.assigned === false || train.stopsAway === undefined) return ""
+    var away = Number(train.stopsAway)
+    if (away === 0) return train.posStatus === "at" ? "At the platform" : "Arriving next"
+    var count = away + " stop" + (away > 1 ? "s" : "") + " away"
+    if (!train.posStopId || !train.posStatus) return count
+    var station = Stations.stationById(train.posStopId)
+    return count + ", " + (train.posStatus === "at" ? "at " : "approaching ") + (station ? station.name : train.posStopId)
+  }
+
+  // After each poll: the open train-detail view and the leave reminder
+  // follow their train's fresh times (matched by trip id) instead of
+  // staying a snapshot from when they were opened.
+  function syncLiveTrains() {
+    var i
+    if (root.selectedTrain && root.selectedTrain.tripId) {
+      for (i = 0; i < root.arrivals.length; i++) {
+        var a = root.arrivals[i]
+        if (a.tripId === root.selectedTrain.tripId && a.dir === root.selectedTrain.dir) { root.selectedTrain = a; break }
+      }
+    }
+    if (root.leaveAlarm) {
+      for (i = 0; i < root.arrivals.length; i++) {
+        var b = root.arrivals[i]
+        if (root.alarmIsFor(b)) {
+          var next = {}
+          for (var k in root.leaveAlarm) next[k] = root.leaveAlarm[k]
+          next.epoch = b.epoch
+          root.leaveAlarm = next
+          break
+        }
+      }
+    }
   }
 
   // ---- Trip planner: an on-demand "how do I get from A to B" lookup. This
@@ -290,6 +732,7 @@ Panel {
 
   function closeTrainDetail() {
     root.trainDetailOpen = false
+    root.ridePickMode = false
   }
 
   // The 2 physical neighbor stations immediately before the boarding
@@ -365,18 +808,18 @@ Panel {
     var originRoutes = root.distinctRoutesOf(root.tripOrigin.pills)
     var destRoutes = root.distinctRoutesOf(root.tripDestination.pills)
     var candidates = Stations.transferCandidates(originRoutes, destRoutes, [root.tripOrigin.key, root.tripDestination.key])
-    var transferPairs = candidates.slice(0, 12).map(function(c) {
-      return c.entryPill.stopId + ":" + c.entryPill.feedGroup + ":" + c.exitPill.stopId + ":" + c.exitPill.feedGroup
+    var transferPairs = candidates.map(function(c) {
+      return c.entryPill.stopId + ":" + c.entryPill.feedGroup + ":" + c.exitPill.stopId + ":" + c.exitPill.feedGroup + ":" + c.seconds
     }).join(",")
 
     root.tripPendingKey = root.tripRequestKey
     root.tripLoading = true
-    tripProc.command = ["bash", "-lc", Model.tripPollScript(
+    tripProc.command = Model.tripPollCommand(
       root.tripHelper,
       root.joinPairs(root.tripOrigin.pills),
       root.joinPairs(root.tripDestination.pills),
       transferPairs
-    )]
+    )
     tripProc.running = true
   }
 
@@ -400,6 +843,18 @@ Panel {
   function toggle() {
     if (root.opened) root.close()
     else root.openFromHotkey()
+  }
+
+  // Esc steps back one view (picker -> trip planner -> arrivals, or train
+  // detail -> arrivals) instead of closing the whole popup from anywhere.
+  function goBack() {
+    if (root.pickerOpen) root.closePicker()
+    else if (root.ridePickMode) root.ridePickMode = false
+    else if (root.trainDetailOpen) root.closeTrainDetail()
+    else if (root.linesOpen) root.closeLines()
+    else if (root.tripPlannerOpen) root.closeTripPlanner()
+    else if (root.showLegend) root.showLegend = false
+    else root.close()
   }
 
   // Identifies what a request was actually asking for, so a response that
@@ -426,7 +881,7 @@ Panel {
     root.loading = true
     root.loadingStartedAt = Date.now()
     root.loadingElapsedSeconds = 0
-    pollProc.command = ["bash", "-lc", Model.pollScript(root.helper, root.feedGroup, root.stopId, root.direction, root.routeFilter, root.alertRoutes)]
+    pollProc.command = Model.pollCommand(root.helper, root.feedGroup, root.stopId, root.direction, root.routeFilter, root.alertRoutes, root.complexIds, root.rideToken)
     pollProc.running = true
   }
 
@@ -437,9 +892,16 @@ Panel {
     root.arrivals = []
     root.alerts = []
     root.generalAlerts = []
+    root.feedTimestamp = 0
+    root.outages = []
+    root.failedFeeds = []
     root.lastError = ""
     root.lastErrorDetail = ""
     root.alertsExpanded = false
+    root.plannedExpanded = false
+    root.outagesExpanded = false
+    root.extraArrivals = 0
+    root.trainDetailOpen = false
     root.approachExpanded = false
   }
 
@@ -447,7 +909,22 @@ Panel {
   onFeedGroupChanged: { resetForNewStation(); refresh() }
   onDirectionChanged: { selectedDirection = root.direction === "S" ? "S" : "N"; refresh() }
   onRouteFilterChanged: refresh()
-  onOpenedChanged: if (opened) refresh()
+  // Reopening from the bar always lands on the arrivals board, not on
+  // whatever sub-view (a train's detail, the picker) was left open; the
+  // trip planner's From/To picks are kept.
+  onOpenedChanged: {
+    if (opened) {
+      refresh()
+    } else {
+      root.trainDetailOpen = false
+      root.pickerOpen = false
+      root.tripPlannerOpen = false
+      root.linesOpen = false
+      root.showLegend = false
+      root.ridePickMode = false
+      root.extraArrivals = 0
+    }
+  }
   Component.onCompleted: refresh()
 
   Process {
@@ -472,7 +949,14 @@ Panel {
           root.arrivals = parsed.arrivals
           root.alerts = parsed.alerts
           root.generalAlerts = parsed.generalAlerts
+          root.feedTimestamp = parsed.feedTimestamp
+          root.outages = parsed.outages
+          root.failedFeeds = parsed.failedFeeds
+          root.nowSeconds = Date.now() / 1000
           root.lastError = ""
+          root.syncLiveTrains()
+          root.updateRide(parsed.ride)
+          root.notifyNewAlerts()
         } else {
           root.lastError = parsed.error
           root.lastErrorDetail = parsed.detail || ""
@@ -559,7 +1043,7 @@ Panel {
       // Let the search field receive plain letters normally instead of
       // PanelKeyCatcher's vim-style j/k/h/l/x navigation intercepting them.
       blocked: searchField.activeFocus
-      onCloseRequested: root.pickerOpen ? root.closePicker() : root.close()
+      onCloseRequested: root.goBack()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
     Flickable {
@@ -579,7 +1063,7 @@ Panel {
         // ================= Arrivals view =================
         Column {
           id: arrivalsView
-          visible: !root.pickerOpen && !root.tripPlannerOpen && !root.trainDetailOpen
+          visible: !root.pickerOpen && !root.tripPlannerOpen && !root.trainDetailOpen && !root.linesOpen
           width: parent.width
           spacing: Style.space(14)
 
@@ -620,7 +1104,7 @@ Panel {
               // them instead of eliding before it. The help link used to
               // live up here too (see subtitleRow below for where it
               // moved) and left even less room for the chevron.
-              anchors.right: clockToggleIcon.left
+              anchors.right: favoriteIcon.left
               anchors.rightMargin: Style.space(8)
               anchors.top: parent.top
               spacing: Style.space(2)
@@ -635,14 +1119,18 @@ Panel {
                 font.pixelSize: Style.font.title
                 font.bold: true
               }
-              Row {
+              // A Flow so the links wrap to a second line instead of
+              // running off the edge with a long stop summary.
+              Flow {
                 id: subtitleRow
+                width: parent.width
                 spacing: Style.space(8)
 
                 Text {
                   textFormat: Text.PlainText
-                  text: root.stopId === "" ? "No stop configured" : ("Stop " + root.stopId)
-                  color: root.dim
+                  text: root.stopId === "" ? "No stop configured"
+                    : (root.stopSummary + (root.feedStale ? " · data " + root.feedAgeMinutes + "m old" : ""))
+                  color: root.feedStale ? "#E8A33D" : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                 }
@@ -672,6 +1160,20 @@ Panel {
                   font.pixelSize: Style.font.caption
                   onActivated: root.openTripPlanner()
                 }
+                Text {
+                  textFormat: Text.PlainText
+                  text: "|"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+                TextLink {
+                  text: "Lines"
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  onActivated: root.openLines()
+                }
+
                 Text {
                   textFormat: Text.PlainText
                   text: "|"
@@ -714,6 +1216,21 @@ Panel {
               onActivated: root.showClockTime = !root.showClockTime
             }
 
+            // Saves/unsaves this station (and line, if one was picked) as a
+            // favorite chip below the header.
+            IconTapText {
+              id: favoriteIcon
+              visible: root.stopId !== ""
+              text: root.isFavorite ? "★" : "☆"
+              color: root.isFavorite ? Color.accent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              anchors.right: clockToggleIcon.left
+              anchors.rightMargin: Style.space(10)
+              anchors.verticalCenter: clockToggleIcon.verticalCenter
+              onActivated: root.toggleFavorite()
+            }
+
             Text {
               textFormat: Text.PlainText
               visible: root.loading
@@ -724,7 +1241,7 @@ Panel {
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
-              anchors.right: clockToggleIcon.left
+              anchors.right: favoriteIcon.left
               anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: clockToggleIcon.verticalCenter
 
@@ -733,6 +1250,130 @@ Panel {
                 from: 0; to: 360
                 duration: 900
                 loops: Animation.Infinite
+              }
+            }
+          }
+
+          // ---- Riding banner: the train you said you're on, and your stop.
+          Rectangle {
+            visible: !!root.ride
+            width: parent.width
+            height: rideColumn.implicitHeight + Style.space(16)
+            radius: Style.cornerRadius
+            color: Style.selectedFillFor(root.foreground, Color.accent)
+            border.width: 1
+            border.color: Color.accent
+
+            Column {
+              id: rideColumn
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.margins: Style.space(8)
+              spacing: Style.space(2)
+
+              Item {
+                width: parent.width
+                height: rideTitle.implicitHeight
+
+                Text {
+                  id: rideTitle
+                  textFormat: Text.PlainText
+                  anchors.left: parent.left
+                  anchors.right: rideEnd.left
+                  anchors.rightMargin: Style.space(8)
+                  elide: Text.ElideRight
+                  text: root.ride ? "🚇 On the " + root.ride.route + " · getting off at " + root.ride.alightName : ""
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  font.bold: true
+                }
+                TextLink {
+                  id: rideEnd
+                  anchors.right: parent.right
+                  text: "End"
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  onActivated: root.endRide()
+                }
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: root.ride
+                  ? "Arrives " + Model.formatClockTime(root.ride.alightEpoch)
+                    + " · in " + Model.formatMinutes(Math.max(0, (root.ride.alightEpoch - root.nowSeconds) / 60))
+                    + (root.ride.stopsLeft === 0 ? " · next stop" : root.ride.stopsLeft > 0 ? " · " + (root.ride.stopsLeft + 1) + " stops" : "")
+                  : ""
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
+          // ---- Favorite stations: one tap to switch the board (and the
+          // bar) to it; right-click tags it as the AM or PM commute station.
+          Flow {
+            visible: root.favorites.length > 0
+            width: parent.width
+            spacing: Style.space(6)
+
+            Repeater {
+              model: root.favorites
+              delegate: Rectangle {
+                id: favChip
+                required property var modelData
+                required property int index
+                readonly property bool current: root.favoriteMatches(modelData)
+                readonly property bool hovered: favArea.containsMouse
+                readonly property string role: String(modelData.role || "")
+                width: favRow.implicitWidth + Style.space(16)
+                height: Style.space(24)
+                radius: height / 2
+                antialiasing: true
+                color: current
+                  ? Style.selectedFillFor(root.foreground, Color.accent)
+                  : (hovered ? Style.hoverFillFor(root.foreground, Color.accent) : Style.normalFillFor(root.foreground, Color.accent))
+                border.width: current ? 1 : 0
+                border.color: Color.accent
+
+                Row {
+                  id: favRow
+                  anchors.centerIn: parent
+                  spacing: Style.space(4)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: Model.truncateName(favChip.modelData.label || favChip.modelData.stopId, 16)
+                      + (favChip.modelData.routeFilter ? " (" + favChip.modelData.routeFilter + ")" : "")
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: favChip.current
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    visible: favChip.role !== ""
+                    text: favChip.role.toUpperCase()
+                    color: Color.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+                }
+
+                MouseArea {
+                  id: favArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  acceptedButtons: Qt.LeftButton | Qt.RightButton
+                  onClicked: function(mouse) {
+                    if (mouse.button === Qt.RightButton) root.cycleFavoriteRole(favChip.index)
+                    else root.switchToFavorite(favChip.modelData)
+                  }
+                }
               }
             }
           }
@@ -774,6 +1415,12 @@ Panel {
                   { sample: "6", color: "#00933C", note: "A colored circle is a subway line. Each row's circle shows which line that train is on." },
                   { sample: "⚠", color: "#5A6268", note: "A dim, blinking badge means that line isn't running right now — it's still part of the station, just not in service." },
                   { sample: "3", color: "#E8A33D", note: "The number next to \"Service Alerts\" is how many are active for this station's lines. Tap it to show or hide them." },
+                  { sample: "◆", color: "#00933C", note: "A ◆ after a destination marks a peak-direction express (the diamond 6, 7, or F), which skips local stops." },
+                  { sample: "−", color: "#00933C", note: "Tap a line's circle under the alerts to hide or show its trains; hover shows − or +. \"Select all\" brings every line back." },
+                  { sample: "🚇", color: "#5A6268", note: "On a train? Tap it, then \"I'm on this train\" and your stop: the bar counts down to it and you get a notification when it's next." },
+                  { sample: "~", color: "#5A6268", note: "A ~ before a time means no train has been assigned to that trip yet — it's the schedule's guess, and the trip may not run." },
+                  { sample: "★", color: "#5A6268", note: "☆ at the top right saves this station as a favorite. Tap a favorite to switch to it; right-click it to mark it AM or PM, then turn on commute mode in the widget settings to switch automatically." },
+                  { sample: "🔔", color: "#5A6268", note: "Tap a train, then \"Remind me\", for a notification when it's time to leave (set your walk time in the widget settings)." },
                   { sample: "⇄", color: "#5A6268", note: "\"Uptown\"/\"Downtown\" (or a station's real signage, like \"Queens\"/\"Manhattan\") picks which direction's trains are listed." }
                 ]
                 delegate: Row {
@@ -928,7 +1575,7 @@ Panel {
           // A count badge always summarizes them; past 2, the full banners
           // stay collapsed behind it rather than burying the arrivals list.
           Column {
-            visible: root.alerts.length > 0
+            visible: root.liveAlerts.length > 0
             width: parent.width
             spacing: Style.space(8)
 
@@ -951,7 +1598,7 @@ Panel {
                     id: alertCountText
                     textFormat: Text.PlainText
                     anchors.centerIn: parent
-                    text: String(root.alerts.length)
+                    text: String(root.liveAlerts.length)
                     color: "#1A1A1A"
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -989,15 +1636,19 @@ Panel {
             }
 
             Repeater {
-              model: (!root.alertsNeedCollapse || root.alertsExpanded) ? root.alerts : []
+              model: (!root.alertsNeedCollapse || root.alertsExpanded) ? root.liveAlerts : []
+              // Live problems (delays, suspensions, reroutes) in amber;
+              // informational station notices (entrance closures, boarding
+              // changes) in blue.
               delegate: Rectangle {
                 required property var modelData
+                readonly property bool notice: modelData.kind === "notice"
                 width: arrivalsView.width
-                height: alertText.implicitHeight + Style.space(16)
+                height: alertBody.implicitHeight + Style.space(16)
                 radius: Style.cornerRadius
-                color: Qt.rgba(0.9, 0.55, 0.1, 0.14)
+                color: notice ? Qt.rgba(0.3, 0.55, 0.9, 0.12) : Qt.rgba(0.9, 0.55, 0.1, 0.14)
                 border.width: 1
-                border.color: Qt.rgba(0.9, 0.55, 0.1, 0.4)
+                border.color: notice ? Qt.rgba(0.3, 0.55, 0.9, 0.35) : Qt.rgba(0.9, 0.55, 0.1, 0.4)
 
                 Row {
                   anchors.left: parent.left
@@ -1008,25 +1659,245 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: "⚠"
-                    color: "#E8A33D"
+                    text: notice ? "ℹ" : "⚠"
+                    color: notice ? "#6FA8DC" : "#E8A33D"
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
                   }
 
-                  Text {
-                    id: alertText
-                    textFormat: Text.PlainText
+                  Column {
+                    id: alertBody
                     width: parent.width - Style.space(30)
+                    spacing: Style.space(2)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                      text: modelData.header
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      visible: !!modelData.period
+                      width: parent.width
+                      wrapMode: Text.WordWrap
+                      text: modelData.period || ""
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // ---- Planned work: scheduled service changes in effect right
+          // now (weekend reroutes, skipped stops). Collapsed by default
+          // behind a count — it's known in advance and rarely the reason a
+          // train is late this minute — with each one's dates when expanded.
+          Column {
+            visible: root.plannedAlerts.length > 0
+            width: parent.width
+            spacing: Style.space(8)
+
+            Item {
+              width: plannedSummaryRow.implicitWidth
+              height: plannedSummaryRow.implicitHeight
+
+              Row {
+                id: plannedSummaryRow
+                spacing: Style.space(8)
+
+                Rectangle {
+                  width: Math.max(height, plannedCountText.implicitWidth + Style.space(10))
+                  height: Style.space(20)
+                  radius: height / 2
+                  color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.18)
+                  anchors.verticalCenter: parent.verticalCenter
+
+                  Text {
+                    id: plannedCountText
+                    textFormat: Text.PlainText
+                    anchors.centerIn: parent
+                    text: String(root.plannedAlerts.length)
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "Planned Work"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.plannedExpanded ? "▲ Hide" : "▼ Show"
+                  color: Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                anchors.margins: -Style.space(4)
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.plannedExpanded = !root.plannedExpanded
+              }
+            }
+
+            Repeater {
+              model: root.plannedExpanded ? root.plannedAlerts : []
+              delegate: Rectangle {
+                required property var modelData
+                width: arrivalsView.width
+                height: plannedBody.implicitHeight + Style.space(16)
+                radius: Style.cornerRadius
+                color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.05)
+                border.width: 1
+                border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.16)
+
+                Column {
+                  id: plannedBody
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.margins: Style.space(8)
+                  spacing: Style.space(2)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    width: parent.width
                     wrapMode: Text.WordWrap
                     text: modelData.header
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.bodySmall
                   }
+                  Text {
+                    textFormat: Text.PlainText
+                    visible: !!modelData.period
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: modelData.period || ""
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
                 }
               }
             }
+          }
+
+          // ---- Accessibility: elevators and escalators out of service at
+          // this station complex right now (MTA's equipment-outage feed).
+          // The summary line is always shown — whether the elevator works
+          // decides whether some riders can use the station at all — with
+          // the details (what it serves, when it's due back) on tap.
+          Column {
+            visible: root.outages.length > 0
+            width: parent.width
+            spacing: Style.space(8)
+
+            Item {
+              width: parent.width
+              height: outageSummaryRow.implicitHeight
+
+              Row {
+                id: outageSummaryRow
+                spacing: Style.space(8)
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: "♿"
+                  color: root.elevatorOutageCount > 0 ? "#6FA8DC" : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: Math.min(implicitWidth, arrivalsView.width - Style.space(90))
+                  elide: Text.ElideRight
+                  text: root.outageSummary
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: root.outagesExpanded ? "▲ Hide" : "▼ Show"
+                  color: Color.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                anchors.margins: -Style.space(4)
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.outagesExpanded = !root.outagesExpanded
+              }
+            }
+
+            Repeater {
+              model: root.outagesExpanded ? root.outages : []
+              delegate: Column {
+                required property var modelData
+                width: arrivalsView.width
+                spacing: Style.space(2)
+
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  text: (modelData.type === "elevator" ? "Elevator: " : "Escalator: ") + modelData.serving
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
+                Text {
+                  textFormat: Text.PlainText
+                  width: parent.width
+                  wrapMode: Text.WordWrap
+                  text: (modelData.returns ? "Expected back " + modelData.returns : "No return estimate")
+                    + (modelData.reason ? " · " + modelData.reason : "")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
+          }
+
+          // ---- One feed of a multi-feed board failed: the rest of the
+          // board is still live, but its lines may be missing.
+          Text {
+            textFormat: Text.PlainText
+            visible: root.lastError === "" && root.failedFeeds.length > 0
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "⚠ Couldn't load the " + root.failedFeeds.join(", ") + " feed this time — those lines may be missing."
+            color: "#E8A33D"
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
           }
 
           // ---- Error callout: shown the moment a fetch fails, not just
@@ -1150,19 +2021,46 @@ Panel {
 
             Repeater {
               model: root.allStationRoutes
+              // Click toggles the line in or out of the board (see
+              // toggleRoute); hovering shows what a click will do — "−" on a
+              // selected line, "+" on a deselected (outline) one.
               delegate: RoutePill {
+                id: routeBadge
                 required property string modelData
+                readonly property bool isSelected: root.routeSelected(modelData)
                 route: modelData
                 diameter: Style.space(24)
                 labelFontFamily: root.fontFamily
                 labelPixelSize: Style.font.caption
+                selected: isSelected
+                hoverMark: badgeArea.containsMouse
+                  ? (isSelected ? (root.allStationRoutes.filter(root.routeSelected).length > 1 ? "−" : "") : "+")
+                  : ""
                 // Neutral (not flagged as "not running") while the very
                 // first fetch for this station is still in flight — there's
                 // no live data yet to say otherwise, so don't blink every
                 // badge red just because nothing has loaded.
                 running: root.coldLoading || root.availableRoutes.indexOf(modelData) !== -1
                 blinkPhase: root.blinkPhase
+
+                MouseArea {
+                  id: badgeArea
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.toggleRoute(routeBadge.modelData)
+                }
               }
+            }
+
+            TextLink {
+              visible: root.routeFilterList.length > 0
+              height: Style.space(24)
+              verticalAlignment: Text.AlignVCenter
+              text: "Select all"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              onActivated: root.persistSettings({ routeFilter: "" })
             }
           }
 
@@ -1238,8 +2136,10 @@ Panel {
                 id: arrivalRow
                 required property var modelData
                 readonly property bool hovered: arrivalRowArea.containsMouse
+                readonly property string position: root.positionPhrase(modelData)
+                readonly property string lateness: Model.delayPhrase(modelData)
                 width: arrivalsView.width
-                height: Style.space(44)
+                height: Style.space(position !== "" || lateness !== "" ? 54 : 44)
 
                 Rectangle {
                   anchors.fill: parent
@@ -1251,6 +2151,9 @@ Panel {
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
                   spacing: Style.space(10)
+                  // A scheduled trip with no train assigned yet (see the
+                  // "~" before its time) may not run: shown, but dimmed.
+                  opacity: arrivalRow.modelData.assigned === false ? 0.6 : 1.0
 
                   RoutePill {
                     route: modelData.route
@@ -1260,24 +2163,60 @@ Panel {
                     anchors.verticalCenter: parent.verticalCenter
                   }
 
-                  Text {
-                    textFormat: Text.PlainText
+                  Column {
                     // "4:16 PM" needs more room than "27m"/"now" — widen
                     // the reserved time-column space to match whichever
                     // format is currently showing so it never gets clipped.
-                    width: parent.width - Style.space(26 + (root.showClockTime ? 85 : 60) + 30)
+                    width: parent.width - Style.space(26 + (root.showClockTime ? 95 : 70) + (root.alarmIsFor(arrivalRow.modelData) ? 22 : 0) + 30)
                     anchors.verticalCenter: parent.verticalCenter
-                    text: Model.destinationFor(modelData.route, modelData.dir)
-                    elide: Text.ElideRight
-                    color: root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.body
+                    spacing: Style.space(2)
+
+                    Text {
+                      textFormat: Text.PlainText
+                      width: parent.width
+                      text: root.destinationName(modelData)
+                      elide: Text.ElideRight
+                      color: root.foreground
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.body
+                    }
+
+                    // Where the train is now, and how late it's running
+                    // against the timetable.
+                    Row {
+                      visible: arrivalRow.position !== "" || arrivalRow.lateness !== ""
+                      width: parent.width
+                      spacing: Style.space(6)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        visible: arrivalRow.position !== ""
+                        width: Math.min(implicitWidth, parent.width - (arrivalRow.lateness !== "" ? lateText.implicitWidth + Style.space(6) : 0))
+                        elide: Text.ElideRight
+                        text: arrivalRow.position
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                      Text {
+                        id: lateText
+                        textFormat: Text.PlainText
+                        visible: arrivalRow.lateness !== ""
+                        text: arrivalRow.lateness
+                        color: "#E8A33D"
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
                   }
 
                   Text {
                     textFormat: Text.PlainText
                     anchors.verticalCenter: parent.verticalCenter
-                    text: root.showClockTime ? Model.formatClockTime(modelData.epoch) : Model.formatMinutes(modelData.minutes)
+                    text: (root.alarmIsFor(modelData) ? "🔔 " : "")
+                      + (root.showClockTime
+                        ? (modelData.assigned === false ? "~" : "") + Model.formatClockTime(modelData.epoch)
+                        : Model.formatCountdown(modelData))
                     color: root.dim
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
@@ -1311,6 +2250,34 @@ Panel {
                   onClicked: root.openTrainDetail(arrivalRow.modelData)
                 }
               }
+            }
+          }
+
+          // ---- More arrivals than maxResults, for this look only.
+          Row {
+            visible: root.stopId !== "" && (root.hiddenArrivals > 0 || root.extraArrivals > 0)
+            spacing: Style.space(14)
+
+            TextLink {
+              visible: root.hiddenArrivals > 0
+              text: "+" + Math.min(5, root.hiddenArrivals) + " more"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              onActivated: root.extraArrivals += 5
+            }
+            TextLink {
+              visible: root.hiddenArrivals > 5
+              text: "+" + Math.min(10, root.hiddenArrivals) + " more"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              onActivated: root.extraArrivals += 10
+            }
+            TextLink {
+              visible: root.extraArrivals > 0
+              text: "Show fewer"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              onActivated: root.extraArrivals = 0
             }
           }
 
@@ -1372,7 +2339,7 @@ Panel {
                 textFormat: Text.PlainText
                 width: parent.width
                 elide: Text.ElideRight
-                text: root.selectedTrain ? ("To " + Model.destinationFor(root.selectedTrain.route, root.selectedTrain.dir)) : ""
+                text: root.selectedTrain ? ("To " + root.destinationName(root.selectedTrain)) : ""
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.title
@@ -1380,7 +2347,12 @@ Panel {
               }
               Text {
                 textFormat: Text.PlainText
-                text: root.selectedTrain ? Model.directionTabLabel(root.selectedTrain.dir) : ""
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: root.selectedTrain
+                  ? [Model.directionTabLabel(root.selectedTrain.dir), root.positionPhrase(root.selectedTrain), Model.delayPhrase(root.selectedTrain)]
+                    .filter(function(t) { return t !== "" }).join(" · ")
+                  : ""
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -1417,6 +2389,55 @@ Panel {
 
           Text {
             textFormat: Text.PlainText
+            visible: !!root.selectedTrain && root.selectedTrain.assigned === false
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Scheduled trip — no train has been assigned to it yet, so it may not run."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          TextLink {
+            visible: !!root.selectedTrain && !!root.selectedTrain.tripId
+            text: root.alarmIsFor(root.selectedTrain)
+              ? "🔔 Reminder set — cancel"
+              : (root.walkMinutes > 0
+                ? "Remind me when to leave (" + root.walkMinutes + " min walk)"
+                : "Remind me 2 min before it arrives")
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            onActivated: {
+              if (root.alarmIsFor(root.selectedTrain)) root.cancelLeaveAlarm()
+              else root.setLeaveAlarm(root.selectedTrain)
+            }
+          }
+
+          TextLink {
+            readonly property bool ridingThis: !!root.ride && !!root.selectedTrain && root.ride.tripId === root.selectedTrain.tripId
+            visible: !!root.selectedTrain && !!root.selectedTrain.tripId && !!root.selectedTrain.feed && root.selectedTrain.assigned !== false
+            text: ridingThis ? "🚇 Riding this train — end ride" : (root.ridePickMode ? "Cancel" : "I'm on this train")
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            onActivated: {
+              if (ridingThis) root.endRide()
+              else root.ridePickMode = !root.ridePickMode
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            visible: root.ridePickMode
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Tap the stop you're getting off at."
+            color: Color.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            textFormat: Text.PlainText
             visible: !root.selectedTrain || root.selectedTrain.stops.length === 0
             width: parent.width
             text: "No stop details available for this train."
@@ -1440,8 +2461,24 @@ Panel {
                 id: stopRow
                 required property var modelData
                 required property int index
+                readonly property bool pickable: root.ridePickMode && !modelData.isContext && !modelData.isBoard
                 width: trainDetailView.width
                 height: Style.space(40)
+
+                // Ride pick mode: any stop after boarding can be your stop.
+                Rectangle {
+                  anchors.fill: parent
+                  visible: stopRow.pickable && stopPickArea.containsMouse
+                  color: Style.hoverFillFor(root.foreground, Color.accent)
+                }
+                MouseArea {
+                  id: stopPickArea
+                  anchors.fill: parent
+                  enabled: stopRow.pickable
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.startRide(root.selectedTrain, stopRow.modelData.stopId, stopRow.modelData.epoch)
+                }
 
                 Text {
                   id: boardMarker
@@ -1498,6 +2535,207 @@ Panel {
                 }
               }
             }
+          }
+        }
+
+        // ================= Lines view =================
+        // Every line's status at a glance: delays, planned work, good
+        // service, or not running right now, with trains in service. Tap a
+        // line with alerts to read them.
+        Column {
+          id: linesView
+          visible: root.linesOpen && !root.pickerOpen
+          width: parent.width
+          spacing: Style.space(10)
+
+          Item {
+            width: parent.width
+            height: linesTitle.implicitHeight
+
+            Text {
+              id: linesTitle
+              textFormat: Text.PlainText
+              text: "Line Status"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+            }
+            IconTapText {
+              text: "✕"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              onActivated: root.closeLines()
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            visible: root.lines.length > 0
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: (root.linesWithDelays === 0 ? "No delays reported" : root.linesWithDelays + " line" + (root.linesWithDelays > 1 ? "s" : "") + " with delays")
+              + (root.linesNotRunning > 0 ? " · " + root.linesNotRunning + " not running now" : "")
+              + (root.linesLoading ? " · updating…" : "")
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            visible: root.linesLoading && root.lines.length === 0
+            text: "Checking every line…"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            visible: root.linesError !== ""
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "⚠ " + Model.errorText(root.linesError)
+            color: "#E8604D"
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+
+          Column {
+            width: parent.width
+            spacing: 0
+
+            Repeater {
+              model: root.lines
+              delegate: Item {
+                id: lineRow
+                required property var modelData
+                readonly property bool expanded: root.expandedLine === modelData.routeId
+                readonly property bool hasAlerts: modelData.alerts && modelData.alerts.length > 0
+                width: linesView.width
+                height: lineColumn.implicitHeight + Style.space(12)
+
+                MouseArea {
+                  id: lineArea
+                  anchors.fill: parent
+                  enabled: lineRow.hasAlerts
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.expandedLine = lineRow.expanded ? "" : lineRow.modelData.routeId
+                }
+
+                Rectangle {
+                  anchors.fill: parent
+                  visible: lineRow.hasAlerts && lineArea.containsMouse
+                  color: Style.hoverFillFor(root.foreground, Color.accent)
+                }
+
+                Column {
+                  id: lineColumn
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(6)
+
+                  Item {
+                    width: parent.width
+                    height: Style.space(26)
+
+                    RoutePill {
+                      id: linePill
+                      route: lineRow.modelData.route
+                      diameter: Style.space(24)
+                      labelFontFamily: root.fontFamily
+                      labelPixelSize: Style.font.caption
+                      running: lineRow.modelData.status !== "none"
+                      anchors.left: parent.left
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Text {
+                      textFormat: Text.PlainText
+                      anchors.left: linePill.right
+                      anchors.leftMargin: Style.space(10)
+                      anchors.right: lineCount.left
+                      anchors.rightMargin: Style.space(8)
+                      anchors.verticalCenter: parent.verticalCenter
+                      elide: Text.ElideRight
+                      text: Model.lineStatusText(lineRow.modelData)
+                        + (lineRow.modelData.label ? " · " + lineRow.modelData.label : "")
+                        + (lineRow.hasAlerts ? (lineRow.expanded ? "  ▲" : "  ▼") : "")
+                      color: lineRow.modelData.status === "delays" ? "#E8A33D"
+                        : lineRow.modelData.status === "good" ? root.foreground : root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      font.bold: lineRow.modelData.status === "delays"
+                    }
+                    Text {
+                      id: lineCount
+                      textFormat: Text.PlainText
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: lineRow.modelData.trains > 0 ? lineRow.modelData.trains + " trains" : ""
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  Repeater {
+                    model: lineRow.expanded ? lineRow.modelData.alerts : []
+                    delegate: Column {
+                      required property var modelData
+                      width: lineColumn.width
+                      spacing: Style.space(2)
+
+                      Text {
+                        textFormat: Text.PlainText
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        text: (modelData.kind === "planned" ? "Planned: " : modelData.kind === "notice" ? "Notice: " : "") + modelData.header
+                        color: root.foreground
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                      Text {
+                        textFormat: Text.PlainText
+                        visible: !!modelData.period
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        text: modelData.period || ""
+                        color: root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+                  }
+                }
+
+                Rectangle {
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.bottom: parent.bottom
+                  height: Style.spacing.hairline
+                  color: root.foreground
+                  opacity: 0.1
+                }
+              }
+            }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Train counts are trains in service right now, from the MTA's live feeds."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
           }
         }
 
@@ -1734,45 +2972,18 @@ Panel {
             }
           }
 
-          // ---- Direct route result
+          // ---- One-transfer route result. Listed first: the helper only
+          // returns a transfer when there's no direct ride or when it beats
+          // the direct ride (the 1 to 96 St, then across the platform to a
+          // 2/3 express), so when it's here it's the better option.
           Column {
-            visible: !!root.tripResult && root.tripResult.direct.length > 0
-            width: parent.width
-            spacing: Style.space(8)
-
-            Text {
-              textFormat: Text.PlainText
-              text: "DIRECT — NO TRANSFER NEEDED"
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
-              font.letterSpacing: 1
-            }
-
-            Repeater {
-              model: root.tripResult ? root.tripResult.direct.slice(0, 3) : []
-              delegate: TripLegRow {
-                required property var modelData
-                width: tripPlannerView.width
-                route: modelData.route
-                primaryText: Model.directionTabLabel(modelData.dir) + " · " + Model.departPhrase(modelData.departMinutes)
-                secondaryText: Model.arrivePhrase(modelData.arriveMinutes)
-                foreground: root.foreground
-                dim: root.dim
-                fontFamily: root.fontFamily
-              }
-            }
-          }
-
-          // ---- One-transfer route result
-          Column {
-            visible: !!root.tripResult && root.tripResult.direct.length === 0 && root.tripResult.transfers.length > 0
+            visible: !!root.tripResult && root.tripResult.transfers.length > 0
             width: parent.width
             spacing: Style.space(10)
 
             Text {
               textFormat: Text.PlainText
-              text: "ONE TRANSFER"
+              text: root.tripResult && root.tripResult.direct.length > 0 ? "FASTER WITH ONE TRANSFER" : "ONE TRANSFER"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1791,6 +3002,8 @@ Panel {
                   route: modelData.leg1.route
                   primaryText: Model.directionTabLabel(modelData.leg1.dir) + " · " + Model.departPhrase(modelData.leg1.departMinutes)
                   secondaryText: "Transfer at " + (Stations.stationById(modelData.transferStopId) ? Stations.stationById(modelData.transferStopId).name : "—")
+                    + (modelData.transferSeconds === 0 ? " (across the platform)"
+                      : modelData.transferSeconds ? " (" + Math.round(modelData.transferSeconds / 60) + " min walk)" : "")
                   foreground: root.foreground
                   dim: root.dim
                   fontFamily: root.fontFamily
@@ -1805,6 +3018,36 @@ Panel {
                   dim: root.dim
                   fontFamily: root.fontFamily
                 }
+              }
+            }
+          }
+
+          // ---- Direct route result
+          Column {
+            visible: !!root.tripResult && root.tripResult.direct.length > 0
+            width: parent.width
+            spacing: Style.space(8)
+
+            Text {
+              textFormat: Text.PlainText
+              text: root.tripResult && root.tripResult.transfers.length > 0 ? "DIRECT" : "DIRECT — NO TRANSFER NEEDED"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.letterSpacing: 1
+            }
+
+            Repeater {
+              model: root.tripResult ? root.tripResult.direct.slice(0, 3) : []
+              delegate: TripLegRow {
+                required property var modelData
+                width: tripPlannerView.width
+                route: modelData.route
+                primaryText: Model.directionTabLabel(modelData.dir) + " · " + Model.departPhrase(modelData.departMinutes)
+                secondaryText: Model.arrivePhrase(modelData.arriveMinutes)
+                foreground: root.foreground
+                dim: root.dim
+                fontFamily: root.fontFamily
               }
             }
           }
@@ -1946,6 +3189,17 @@ Panel {
 
           Text {
             textFormat: Text.PlainText
+            visible: root.pickerPurpose === "station" && root.pickerResults.length > 0
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Tap a station's name to track every line there, or one line's bullet to track just that line."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            textFormat: Text.PlainText
             visible: (root.pickerQuery !== "" || root.pickerRouteFilter !== "") && root.pickerResults.length === 0
             width: parent.width
             text: "No stations match."
@@ -1969,45 +3223,29 @@ Panel {
               delegate: Item {
                 id: stationRow
                 required property var modelData
-                // Pills sharing a stop_id are the same physical platform —
-                // picking any one of them (e.g. N/Q/R/W at Union Sq) has the
-                // identical effect, so hovering one highlights all of them
-                // together rather than just the pill under the cursor.
-                property string hoveredStopId: ""
-                // True for a row like Penn Station (1/2/3 on one feed, A/C/E
-                // on another) where no single whole-row pick could ever
-                // cover every line — picking "the dominant feed" here would
-                // silently drop the other feed's lines with no indication,
-                // which is exactly the crossover confusion this avoids: for
-                // these rows, only a specific pill tap is allowed to track
-                // a station (the note below explains why).
-                readonly property bool multiFeed: Stations.pillsSpanMultipleFeeds(modelData.pills)
+                // Each pill narrows the board to just its own line at its
+                // own platform, so hover highlights that one pill only.
+                property string hoveredKey: ""
                 width: pickerView.width
                 height: resultRow.implicitHeight + Style.space(16)
 
                 // Whole-row background click, declared BEFORE the pills
                 // Column below so the pills (which paint on top) always win
                 // a click landed directly on one of them. "station" purpose:
-                // picking anywhere else on the row tracks every line sharing
-                // the row's dominant feed (all of Grand Central's 4/5/6, 7,
-                // and S, since they're all one feed) rather than requiring a
-                // specific pill tap — see Stations.dominantFeedGroupStopIds —
-                // except when multiFeed is true, where there's no single
-                // "whole row" pick that wouldn't silently drop lines, so
-                // this is a no-op and a pill tap is required instead.
-                // Trip-planner purposes: unchanged, selects the whole
-                // complex since any of its lines could be the one with a
-                // live connection (transfer routing only needs to know
-                // every route the complex serves, not to poll it live).
+                // tracks every line at the station as one board — every
+                // platform, across however many realtime feeds that takes
+                // (Times Sq's 1/2/3, 7, S, A/C/E and N/Q/R/W all at once; see
+                // Stations.stopTokensForPills). Trip-planner purposes: selects
+                // the whole complex, since any of its lines could be the one
+                // with a live connection.
                 MouseArea {
                   anchors.fill: parent
                   cursorShape: Qt.PointingHandCursor
                   onClicked: {
                     if (root.pickerPurpose === "station") {
                       var pills = stationRow.modelData.pills
-                      if (pills && pills.length > 0 && !stationRow.multiFeed) {
-                        var group = Stations.dominantFeedGroupStopIds(pills)
-                        root.pickStation({ id: group.stopIds.join(","), feedGroup: group.feedGroup, name: stationRow.modelData.name })
+                      if (pills && pills.length > 0) {
+                        root.pickStation({ id: Stations.stopTokensForPills(pills), feedGroup: pills[0].feedGroup, name: stationRow.modelData.name })
                       }
                     } else {
                       root.selectTripStation(stationRow.modelData)
@@ -2031,17 +3269,6 @@ Panel {
                     font.bold: true
                   }
 
-                  Text {
-                    textFormat: Text.PlainText
-                    visible: root.pickerPurpose === "station" && stationRow.multiFeed
-                    width: resultRow.width
-                    wrapMode: Text.WordWrap
-                    text: "Spans multiple feeds — tap a specific line below"
-                    color: root.dim
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-
                   Flow {
                     width: resultRow.width
                     spacing: Style.space(6)
@@ -2051,7 +3278,7 @@ Panel {
                       delegate: Rectangle {
                         id: resultPill
                         required property var modelData
-                        readonly property bool hovered: stationRow.hoveredStopId === modelData.stopId
+                        readonly property bool hovered: stationRow.hoveredKey === modelData.stopId + "|" + modelData.route
                         width: Style.space(26)
                         height: Style.space(26)
                         radius: width / 2
@@ -2087,12 +3314,13 @@ Panel {
                           enabled: root.pickerPurpose === "station"
                           hoverEnabled: true
                           cursorShape: Qt.PointingHandCursor
-                          onEntered: stationRow.hoveredStopId = resultPill.modelData.stopId
-                          onExited: if (stationRow.hoveredStopId === resultPill.modelData.stopId) stationRow.hoveredStopId = ""
+                          onEntered: stationRow.hoveredKey = resultPill.modelData.stopId + "|" + resultPill.modelData.route
+                          onExited: if (stationRow.hoveredKey === resultPill.modelData.stopId + "|" + resultPill.modelData.route) stationRow.hoveredKey = ""
                           onClicked: root.pickStation({
-                            id: resultPill.modelData.stopId,
+                            id: resultPill.modelData.stopId + ":" + resultPill.modelData.feedGroup,
                             feedGroup: resultPill.modelData.feedGroup,
-                            name: stationRow.modelData.name
+                            name: stationRow.modelData.name,
+                            routeFilter: resultPill.modelData.route
                           })
                         }
                       }

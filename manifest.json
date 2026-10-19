@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "tirade.nyc-subway",
   "name": "OMTArchy - NYC Subway MTA",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "author": "tirade",
   "license": "MIT",
-  "description": "Live NYC subway arrivals for any station, straight from the MTA's GTFS-realtime feeds — no API key needed. Shows next arrivals in the bar and a full detail popup with whole-station multi-line tracking, search or browse by line, service alerts, a trip planner for direct and one-transfer routes, per-train stop-by-stop detail, and a “you are here” context strip for unfamiliar directions.",
+  "description": "Live NYC subway arrivals for any station, straight from the MTA's GTFS-realtime feeds — no API key needed. Shows the next trains in the bar and a full detail popup: whole-station boards (even Times Sq, across every feed), each train's real destination, service alerts split from planned work, elevator and escalator outages, a trip planner that knows when an express transfer beats riding direct, per-train stop-by-stop detail, leave-now reminders, and favorite stations with automatic AM/PM commute switching.",
   "kinds": [
     "bar-widget"
   ],
@@ -25,29 +25,47 @@
       "routeFilter": "",
       "maxResults": 5,
       "pollIntervalMs": 30000,
-      "label": ""
+      "label": "",
+      "walkMinutes": 0,
+      "barArrivals": 2,
+      "commuteAuto": false,
+      "commuteSwitchHour": 12,
+      "alertNotify": "commute"
     },
     "schema": [
       {
         "key": "feedGroup",
         "type": "enum",
         "label": "Line group",
-        "options": ["1234567S", "ACE", "BDFM", "G", "JZ", "NQRW", "L", "SIR"],
+        "options": [
+          "1234567S",
+          "ACE",
+          "BDFM",
+          "G",
+          "JZ",
+          "NQRW",
+          "L",
+          "SIR"
+        ],
         "defaultValue": "1234567S",
-        "description": "Which MTA GTFS-realtime feed to poll. Set automatically when you pick a station with \"Change\" in the popup; only matters here if you're typing a Stop ID by hand below."
+        "description": "Which MTA GTFS-realtime feed to poll for any Stop ID below that doesn't name its own. Set automatically when you pick a station with \"Change\" in the popup; only matters if you're typing a Stop ID by hand."
       },
       {
         "key": "stopId",
         "type": "string",
         "label": "Stop ID",
         "defaultValue": "127",
-        "description": "GTFS stop_id for the station. Normally set for you by the in-popup station picker (search by name or browse by line) — this field is a manual fallback for a stop_id the picker doesn't have. Can be a comma-separated list of stop_ids sharing one feed, to track a whole multi-line complex (e.g. Grand Central's 4/5/6, 7, and S platforms) as a single board — set automatically when you click a station row instead of one of its line pills."
+        "description": "GTFS stop_id for the station. Normally set for you by the in-popup station picker — this field is a manual fallback. Can be a comma-separated list to track a whole complex as one board; each entry may name its own feed as stopId:feedGroup (e.g. 127:1234567S,R16:NQRW,A27:ACE for Times Sq), which is what tapping a station's name in the picker sets."
       },
       {
         "key": "direction",
         "type": "enum",
         "label": "Direction",
-        "options": ["both", "N", "S"],
+        "options": [
+          "both",
+          "N",
+          "S"
+        ],
         "defaultValue": "both",
         "description": "both shows an Uptown/Downtown toggle in the popup. N or S locks the popup to just that direction (N = uptown/northbound, S = downtown/southbound)."
       },
@@ -56,7 +74,7 @@
         "type": "string",
         "label": "Routes (optional)",
         "defaultValue": "",
-        "description": "Comma-separated route IDs to fetch, e.g. 1,2,3. Blank fetches every route serving this stop; tap a route's pill in the popup to focus on just that line."
+        "description": "Comma-separated route IDs to show, e.g. 1,2,3. Blank shows every route serving this stop. Toggled by clicking the line circles in the popup (or one line's bullet in the station picker); \"Select all\" clears it."
       },
       {
         "key": "maxResults",
@@ -79,11 +97,60 @@
         "description": "MTA feeds update roughly every 30s; polling faster than that just burns CPU."
       },
       {
+        "key": "barArrivals",
+        "type": "integer",
+        "label": "Trains in the bar",
+        "min": 1,
+        "max": 3,
+        "step": 1,
+        "defaultValue": 2,
+        "description": "How many upcoming trains the bar lists, e.g. \"⬆❹ · 2m, 6m\"."
+      },
+      {
+        "key": "walkMinutes",
+        "type": "integer",
+        "label": "Walk to station (min)",
+        "min": 0,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 0,
+        "description": "Minutes on foot to the station. Above 0, the bar skips trains you can no longer make and says when to leave, and a train's \"Remind me\" fires this long before it arrives. 0 turns this off."
+      },
+      {
+        "key": "commuteAuto",
+        "type": "boolean",
+        "label": "Commute mode",
+        "defaultValue": false,
+        "description": "Switch to your AM favorite before the switch hour and your PM favorite after it. Tag favorites by right-clicking them in the popup."
+      },
+      {
+        "key": "commuteSwitchHour",
+        "type": "integer",
+        "label": "Commute switch hour",
+        "min": 0,
+        "max": 23,
+        "step": 1,
+        "defaultValue": 12,
+        "description": "Hour of the day (0-23) when commute mode switches from the AM favorite to the PM one."
+      },
+      {
+        "key": "alertNotify",
+        "type": "enum",
+        "label": "Alert notifications",
+        "options": [
+          "off",
+          "commute",
+          "always"
+        ],
+        "defaultValue": "commute",
+        "description": "Desktop notification when a new delay appears on this station's selected lines. commute: only while commute mode has you on your AM or PM station. always: whatever station is tracked."
+      },
+      {
         "key": "label",
         "type": "string",
         "label": "Bar label override",
         "defaultValue": "",
-        "description": "Short name shown in the bar, e.g. Times Sq. Defaults to the stop ID."
+        "description": "Short name shown in the bar, e.g. Times Sq. Defaults to the station's name."
       }
     ],
     "aliases": [
