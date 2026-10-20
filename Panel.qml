@@ -117,9 +117,17 @@ Panel {
   property var outages: []
   // Feeds of a multi-feed board that failed this poll (the rest still show).
   property var failedFeeds: []
+  // Ways the MTA's data looked unlike itself this poll (bin/mta_feed.py's
+  // sanity checks). Still shown, but flagged: it may not be the MTA's.
+  property var anomalies: []
   property string lastError: ""
   property string lastErrorDetail: ""
   property bool loading: false
+  // A helper that hasn't finished in this long is stopped. Each bounds its
+  // own downloads (~10 s, ~20 s worst case), so this only catches a hang
+  // somewhere else — which would otherwise block every later refresh.
+  readonly property int helperTimeoutMs: 45000
+  property bool pollTimedOut: false
   property double loadingStartedAt: 0
   property int loadingElapsedSeconds: 0
 
@@ -312,6 +320,7 @@ Panel {
       + (plannedAlerts.length > 0 ? " · " + plannedAlerts.length + " planned work" : "")
       + (elevatorOutageCount > 0 ? " · ♿ " + elevatorOutageCount + " elevator" + (elevatorOutageCount > 1 ? "s" : "") + " out" : "")
       + (failedFeeds.length > 0 ? " · couldn't load " + failedFeeds.join(", ") : "")
+      + (anomalies.length > 0 ? " · ⚠ MTA data looked unusual" : "")
       + (leaveAlarm ? " · 🔔 reminder set for the " + leaveAlarm.route : "")
       + (generalAlerts.length > 0 ? " · " + generalAlerts[0].header : "")
 
@@ -489,9 +498,11 @@ Panel {
 
   // Desktop notifications go through one notify-send Process, queued so
   // two at once (a reminder and a new alert) don't clobber each other.
+  // The body is escaped: the shell renders notification bodies as markup
+  // with live links, and alert text comes straight from the MTA's feed.
   property var notifyQueue: []
   function notify(title, body, urgency) {
-    root.notifyQueue = root.notifyQueue.concat([["notify-send", "-a", "OMTArchy", "-u", urgency || "normal", title, body]])
+    root.notifyQueue = root.notifyQueue.concat([["notify-send", "-a", "OMTArchy", "-u", urgency || "normal", title, Model.escapeMarkup(body)]])
     root.pumpNotify()
   }
   function pumpNotify() {
@@ -605,11 +616,19 @@ Panel {
     root.linesOpen = false
   }
 
+  property bool linesTimedOut: false
   function runLinesQuery() {
     if (linesProc.running) return
     root.linesLoading = true
+    root.linesTimedOut = false
     linesProc.command = ["python3", root.linesHelper]
     linesProc.running = true
+  }
+
+  Timer {
+    interval: root.helperTimeoutMs
+    running: linesProc.running
+    onTriggered: { root.linesTimedOut = true; linesProc.running = false }
   }
 
   Process {
@@ -617,8 +636,12 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var parsed = Model.parseLines(text)
         root.linesLoading = false
+        if (root.linesTimedOut) {
+          root.linesError = "helper-timeout"
+          return
+        }
+        var parsed = Model.parseLines(text)
         if (parsed.ok) {
           root.lines = parsed.lines
           root.linesError = ""
@@ -814,6 +837,7 @@ Panel {
 
     root.tripPendingKey = root.tripRequestKey
     root.tripLoading = true
+    root.tripTimedOut = false
     tripProc.command = Model.tripPollCommand(
       root.tripHelper,
       root.joinPairs(root.tripOrigin.pills),
@@ -879,6 +903,7 @@ Panel {
     }
     root.pendingRequestKey = root.requestKey
     root.loading = true
+    root.pollTimedOut = false
     root.loadingStartedAt = Date.now()
     root.loadingElapsedSeconds = 0
     pollProc.command = Model.pollCommand(root.helper, root.feedGroup, root.stopId, root.direction, root.routeFilter, root.alertRoutes, root.complexIds, root.rideToken)
@@ -895,6 +920,7 @@ Panel {
     root.feedTimestamp = 0
     root.outages = []
     root.failedFeeds = []
+    root.anomalies = []
     root.lastError = ""
     root.lastErrorDetail = ""
     root.alertsExpanded = false
@@ -943,9 +969,15 @@ Panel {
           return
         }
 
-        var parsed = Model.parseArrivals(text)
         root.loading = false
+        if (root.pollTimedOut) {
+          root.lastError = "helper-timeout"
+          root.lastErrorDetail = ""
+          return
+        }
+        var parsed = Model.parseArrivals(text)
         if (parsed.ok) {
+          root.anomalies = parsed.anomalies
           root.arrivals = parsed.arrivals
           root.alerts = parsed.alerts
           root.generalAlerts = parsed.generalAlerts
@@ -973,6 +1005,19 @@ Panel {
     onTriggered: root.refresh()
   }
 
+  Timer {
+    interval: root.helperTimeoutMs
+    running: pollProc.running
+    onTriggered: { root.pollTimedOut = true; pollProc.running = false }
+  }
+
+  property bool tripTimedOut: false
+  Timer {
+    interval: root.helperTimeoutMs
+    running: tripProc.running
+    onTriggered: { root.tripTimedOut = true; tripProc.running = false }
+  }
+
   Process {
     id: tripProc
     stdout: StdioCollector {
@@ -986,8 +1031,14 @@ Panel {
           return
         }
 
-        var parsed = Model.parseTripResult(text)
         root.tripLoading = false
+        if (root.tripTimedOut) {
+          root.tripResult = null
+          root.tripError = "helper-timeout"
+          root.tripErrorDetail = ""
+          return
+        }
+        var parsed = Model.parseTripResult(text)
         if (parsed.ok) {
           root.tripResult = { direct: parsed.direct, transfers: parsed.transfers }
           root.tripError = ""
@@ -1956,6 +2007,52 @@ Panel {
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
+              }
+            }
+          }
+
+          // ---- Feed check callout: the data loaded and is shown, but
+          // something in it fell outside what the MTA's feeds normally look
+          // like (see bin/mta_feed.py). Amber, not red: worth a second look
+          // at the board, not a failure.
+          Rectangle {
+            visible: root.stopId !== "" && root.lastError === "" && root.anomalies.length > 0
+            width: parent.width
+            height: anomalyColumn.implicitHeight + Style.space(16)
+            radius: Style.cornerRadius
+            color: Qt.rgba(0.91, 0.64, 0.24, 0.12)
+            border.width: 1
+            border.color: Qt.rgba(0.91, 0.64, 0.24, 0.45)
+
+            Column {
+              id: anomalyColumn
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.margins: Style.space(8)
+              spacing: Style.space(4)
+
+              Text {
+                textFormat: Text.PlainText
+                width: anomalyColumn.width
+                wrapMode: Text.WordWrap
+                text: "⚠ MTA data looked unusual — double-check before relying on it"
+                color: "#E8A33D"
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+              Repeater {
+                model: root.anomalies.slice(0, 5)
+                Text {
+                  required property var modelData
+                  textFormat: Text.PlainText
+                  width: anomalyColumn.width
+                  wrapMode: Text.WordWrap
+                  text: "· " + modelData
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
               }
             }
           }

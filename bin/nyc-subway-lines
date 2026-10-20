@@ -16,7 +16,6 @@ so it's meant to run only while the Lines view is open.
 """
 import json
 import time
-import urllib.error
 
 import mta_feed
 
@@ -64,6 +63,8 @@ def alert_is_active(alert, now):
 
 
 def main():
+    mta_feed.limit_memory()
+    mta_feed.limit_runtime(mta_feed.HELPER_SECONDS)
     if mta_feed.IMPORT_ERROR is not None:
         print(json.dumps({"error": "missing-protobuf", "detail": str(mta_feed.IMPORT_ERROR)}))
         return
@@ -71,8 +72,7 @@ def main():
     feeds = mta_feed.fetch_feeds(mta_feed.FEED_PATHS.keys())
     if all(isinstance(f, Exception) for f in feeds.values()):
         first = next(iter(feeds.values()))
-        reason = "fetch-failed" if isinstance(first, urllib.error.URLError) else "parse-failed"
-        print(json.dumps({"error": reason, "detail": str(first)}))
+        print(json.dumps({"error": mta_feed.error_reason(first), "detail": str(first)}))
         return
 
     trains = {}
@@ -89,7 +89,7 @@ def main():
 
     alerts_by_route = {}
     try:
-        alerts_feed = mta_feed.parse_feed(mta_feed.cached_bytes(mta_feed.ALERTS_URL, "subway-alerts.pb", ALERTS_CACHE_SECONDS))
+        alerts_feed = mta_feed.parse_feed(mta_feed.cached_bytes(mta_feed.ALERTS_URL, "subway-alerts.pb", ALERTS_CACHE_SECONDS), "subway-alerts")
         now = time.time()
         for entity in alerts_feed.entity:
             if not entity.HasField("alert") or not alert_is_active(entity.alert, now):
@@ -98,6 +98,7 @@ def main():
             header = alert_header(alert).strip()
             if not header:
                 continue
+            mta_feed.check_text(header, "subway-alerts")
             mercury = mta_feed.extension(alert)
             item = {
                 "header": header,

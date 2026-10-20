@@ -31,13 +31,20 @@ import os
 import subprocess
 import sys
 import time
-import urllib.request
 import zipfile
+
+import mta_feed
 
 GTFS_URL = "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_subway.zip"
 # The MTA republishes the static feed every few weeks; a week-old copy is
 # close enough for lateness and saves re-downloading 6 MB.
 GTFS_MAX_AGE = 7 * 24 * 3600
+# The zip was 5.6 MB (43 MB unpacked, stop_times.txt 36 MB of it) on
+# 2026-10-20. Generous ceilings, so a growing timetable never trips them but
+# a swapped-in zip bomb can't fill the disk or memory during a build.
+GTFS_MAX_ZIP_BYTES = 64 << 20
+GTFS_MAX_UNPACKED_BYTES = 512 << 20
+GTFS_DOWNLOAD_SECONDS = 90
 # A build that hasn't finished in this long is assumed dead.
 BUILD_LOCK_SECONDS = 180
 
@@ -135,9 +142,8 @@ def gtfs_zip_path():
             return path
     except OSError:
         pass
-    req = urllib.request.Request(GTFS_URL, headers={"User-Agent": "omarchy-nyc-subway-plugin/1.2"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        raw = resp.read()
+    raw = mta_feed.fetch_bytes(GTFS_URL, GTFS_DOWNLOAD_SECONDS, GTFS_MAX_ZIP_BYTES)
+    os.makedirs(CACHE_DIR, exist_ok=True)
     tmp = path + ".%d" % os.getpid()
     with open(tmp, "wb") as f:
         f.write(raw)
@@ -167,6 +173,11 @@ def build(stop_ids):
     day, midnight = service_day()
     yesterday = day - datetime.timedelta(days=1)
     with zipfile.ZipFile(gtfs_zip_path()) as zf:
+        # Sizes as the zip declares them; zipfile itself stops reading a
+        # member that inflates past its declared size.
+        unpacked = sum(info.file_size for info in zf.infolist())
+        if unpacked > GTFS_MAX_UNPACKED_BYTES:
+            raise mta_feed.FeedRejected("GTFS zip unpacks to %d bytes" % unpacked)
         services = {"today": active_services(zf, day), "yesterday": active_services(zf, yesterday)}
         trip_table = {}  # static trip_id -> (table, key)
         key_counts = {"today": {}, "yesterday": {}}
@@ -220,6 +231,10 @@ def build(stop_ids):
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "build":
+        mta_feed.limit_memory()
+        # Die before the lock goes stale: otherwise a build stuck on a
+        # hostile server outlives it, and every later poll spawns another.
+        mta_feed.limit_runtime(BUILD_LOCK_SECONDS - 10)
         ids = {s for s in sys.argv[2].split(",") if s}
         try:
             build(ids)

@@ -34,7 +34,6 @@ each entirely on one feed.
 import json
 import sys
 import time
-import urllib.error
 
 import mta_feed
 
@@ -167,6 +166,8 @@ def main():
     dest_pairs = parse_pairs(args[1] if len(args) > 1 else "")
     transfer_pairs = parse_transfer_pairs(args[2] if len(args) > 2 else "")
 
+    mta_feed.limit_memory()
+    mta_feed.limit_runtime(mta_feed.HELPER_SECONDS)
     if not origin_pairs or not dest_pairs:
         return fail("no-stop-id")
     if mta_feed.IMPORT_ERROR is not None:
@@ -188,9 +189,7 @@ def main():
         except Exception as e:  # noqa: BLE001
             return fail("parse-failed", e)
     if not indexes and first_error is not None:
-        if isinstance(first_error, urllib.error.URLError):
-            return fail("fetch-failed", first_error)
-        return fail("parse-failed", first_error)
+        return fail(mta_feed.error_reason(first_error), first_error)
 
     now = time.time()
     direct = best_direct(indexes, origin_pairs, dest_pairs, now)[:MAX_RESULTS]

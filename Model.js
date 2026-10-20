@@ -43,6 +43,7 @@ function parseArrivals(raw) {
     outages: Array.isArray(data.outages) ? data.outages : [],
     feedTimestamp: Number(data.feedTimestamp) || 0,
     failedFeeds: Array.isArray(data.failedFeeds) ? data.failedFeeds : [],
+    anomalies: Array.isArray(data.anomalies) ? data.anomalies.map(String) : [],
     ride: data.ride || null
   }
 }
@@ -389,11 +390,19 @@ function errorText(error) {
     case "no-stop-id": return "Set a Stop ID in this widget's settings"
     case "missing-protobuf": return "Python protobuf is missing or too old — install python-protobuf"
     case "fetch-failed": return "Couldn't reach the MTA feed"
+    case "feed-rejected": return "The MTA's response failed a safety check and was ignored"
+    case "helper-timeout": return "The MTA feed took too long and was stopped"
     case "parse-failed": return "Unexpected feed format"
     case "bad-json": return "Helper script output was not valid JSON"
     case "empty": return "No response from the helper script"
     default: return "No data yet"
   }
+}
+
+// Text for a notification body, which the shell renders as markup: feed
+// text must show as written, never as a tag or a live link.
+function escapeMarkup(text) {
+  return String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 }
 
 // Same errors as errorText, but for the trip planner's own context (its
@@ -432,6 +441,7 @@ if (typeof module !== "undefined") {
     arrivalsFor: arrivalsFor,
     barText: barText,
     errorText: errorText,
+    escapeMarkup: escapeMarkup,
     tripErrorText: tripErrorText
   }
 }

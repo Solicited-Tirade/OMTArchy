@@ -29,7 +29,9 @@ Prints {"arrivals": [{"route","routeId","express","assigned","tripId","feed",
 "period"}, ...], "generalAlerts": [...], "outages": [{"type","serving",
 "returns","reason","ada"}, ...], "ride": {"found","alightEpoch","stopsLeft",
 "nextStopId","posStatus"} or null, "feedTimestamp": <epoch>, "failedFeeds":
-[...]}, or {"error": "..."} on failure. Routes in and out use
+[...], "anomalies": [...]}, or {"error": "..."} on failure. anomalies are
+mta_feed's sanity-check findings: ways the MTA's data looked unlike itself
+this poll (see mta_feed's "Expectations"), shown but not acted on. Routes in and out use
 Stations.js's spelling ("S", "SIR", plain 6/7/F) — see mta_feed.py for the
 translation to live-feed route_ids. No API key needed: MTA subway
 GTFS-realtime feeds have been open since 2019.
@@ -37,7 +39,6 @@ GTFS-realtime feeds have been open since 2019.
 import json
 import sys
 import time
-import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
@@ -260,7 +261,7 @@ def fetch_alerts(alert_routes, feed_group):
     if not wanted:
         return [], []
 
-    feed = mta_feed.parse_feed(mta_feed.cached_bytes(mta_feed.ALERTS_URL, "subway-alerts.pb", ALERTS_CACHE_SECONDS))
+    feed = mta_feed.parse_feed(mta_feed.cached_bytes(mta_feed.ALERTS_URL, "subway-alerts.pb", ALERTS_CACHE_SECONDS), "subway-alerts")
     now = time.time()
     seen_headers = set()
     alerts = []
@@ -290,12 +291,15 @@ def fetch_alerts(alert_routes, feed_group):
 
         mercury = mta_feed.extension(alert)
         alert_type = mta_feed.ext_text(mercury, 3)
+        period = mta_feed.ext_translated_text(mercury, 8)
+        mta_feed.check_text(header, "subway-alerts")
+        mta_feed.check_text(period, "subway-alerts")
         item = {
             "routes": sorted({mta_feed.display_route(r) for r in routes & wanted}),
             "header": header,
             "kind": alert_kind(alert_type),
             "type": alert_type,
-            "period": mta_feed.ext_translated_text(mercury, 8),
+            "period": period,
         }
         if len(routes) >= GENERAL_ALERT_ROUTE_THRESHOLD:
             general.append(item)
@@ -322,9 +326,9 @@ def fetch_outages(complex_ids):
     if not wanted:
         return []
 
-    equipment = json.loads(mta_feed.cached_bytes(mta_feed.EQUIPMENT_URL, "ene-equipment.json", EQUIPMENT_CACHE_SECONDS))
+    equipment = mta_feed.load_json_list(mta_feed.cached_bytes(mta_feed.EQUIPMENT_URL, "ene-equipment.json", EQUIPMENT_CACHE_SECONDS), "ene-equipment")
     complex_of = {e.get("equipmentno"): str(e.get("stationcomplexid", "")) for e in equipment}
-    outages = json.loads(mta_feed.cached_bytes(mta_feed.OUTAGES_URL, "ene-outages.json", OUTAGES_CACHE_SECONDS))
+    outages = mta_feed.load_json_list(mta_feed.cached_bytes(mta_feed.OUTAGES_URL, "ene-outages.json", OUTAGES_CACHE_SECONDS), "ene-outages")
 
     out = []
     seen = set()
@@ -335,13 +339,16 @@ def fetch_outages(complex_ids):
         if complex_of.get(equipment_no) not in wanted or equipment_no in seen:
             continue
         seen.add(equipment_no)
-        out.append({
+        item = {
             "type": "elevator" if o.get("equipmenttype") == "EL" else "escalator",
-            "serving": (o.get("serving") or "").strip(),
-            "returns": format_return(o.get("estimatedreturntoservice") or ""),
-            "reason": (o.get("reason") or "").strip(),
+            "serving": str(o.get("serving") or "").strip(),
+            "returns": format_return(str(o.get("estimatedreturntoservice") or "")),
+            "reason": str(o.get("reason") or "").strip(),
             "ada": o.get("ADA") == "Y",
-        })
+        }
+        for text in (item["serving"], item["returns"], item["reason"]):
+            mta_feed.check_text(text, "ene-outages")
+        out.append(item)
     # Elevators first: an elevator outage can make a station unusable for
     # some riders, an escalator outage just means stairs.
     out.sort(key=lambda o: (o["type"] != "elevator", not o["ada"]))
@@ -394,6 +401,8 @@ def main():
     complex_ids = args[5] if len(args) > 5 else ""
     ride = args[6] if len(args) > 6 else ""
 
+    mta_feed.limit_memory()
+    mta_feed.limit_runtime(mta_feed.HELPER_SECONDS)
     if not stop_id:
         return fail("no-stop-id")
     if mta_feed.IMPORT_ERROR is not None:
@@ -421,10 +430,8 @@ def main():
         feeds = mta_feed.fetch_feeds(set(stops_by_feed) | ({ride_feed} if ride_feed else set()))
         try:
             arrivals, feed_timestamp, failed = fetch_arrivals(feeds, stops_by_feed, direction, route_filter, schedule)
-        except urllib.error.URLError as e:
-            return fail("fetch-failed", e)
         except Exception as e:  # noqa: BLE001 - report any failure, never crash silently
-            return fail("parse-failed", e)
+            return fail(mta_feed.error_reason(e), e)
         alerts, general_alerts = best_effort(alerts_future, ([], []))
         outages = best_effort(outages_future, [])
         try:
@@ -440,6 +447,7 @@ def main():
         "ride": ride_info,
         "feedTimestamp": feed_timestamp,
         "failedFeeds": failed,
+        "anomalies": mta_feed.anomalies,
     }))
 
 
