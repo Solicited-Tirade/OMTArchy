@@ -1,25 +1,36 @@
 // Pure data-shaping helpers for the NYC Subway widget. No QML dependency so
 // this can be unit tested with plain node/jest if desired.
 
-// Builds the argv that runs the bundled helper script — exec'd directly, no
-// shell in between, so nothing needs quoting and no login profile runs on
-// every poll. scriptPath is the absolute path to bin/nyc-subway-status
-// (already resolved from Qt.resolvedUrl by the caller). alertRoutes is
-// typically every route serving this stop — passing "" skips the alerts
-// fetch entirely, as "" complexIds does for elevator/escalator outages.
-function pollCommand(scriptPath, feedGroup, stopId, direction, routeFilter, alertRoutes, complexIds, ride) {
-  return ["python3", String(scriptPath), String(feedGroup), String(stopId),
-    String(direction), String(routeFilter), String(alertRoutes), String(complexIds || ""), String(ride || "")]
+// Builds the argv and the stdin line that run a bundled helper script —
+// exec'd directly, no shell in between, so nothing needs quoting and no
+// login profile runs on every poll. scriptPath is the absolute path to
+// the script in bin/ (already resolved from Qt.resolvedUrl by the
+// caller). alertRoutes is typically every route serving this stop — passing
+// "" skips the alerts fetch entirely, as "" complexIds does for
+// elevator/escalator outages.
+function helperCommand(scriptPath) {
+  return ["python3", String(scriptPath)]
+}
+
+function helperInput(values) {
+  return JSON.stringify(values.map(function(v) { return String(v === undefined || v === null ? "" : v) })) + "\n"
+}
+
+function pollInput(feedGroup, stopId, direction, routeFilter, alertRoutes, complexIds, ride, follow) {
+  return helperInput([feedGroup, stopId, direction, routeFilter, alertRoutes, complexIds, ride, follow])
 }
 
 // Parses the helper script's stdout. Returns
 // { ok: true, arrivals, alerts, generalAlerts, outages, feedTimestamp,
-// failedFeeds, ride } or { ok: false, error, detail }.
+// failedFeeds, ride, followed } or { ok: false, error, detail }.
 // Never throws. `alerts` are specific to this station's routes; `generalAlerts`
 // are system-wide notices (holiday/weekend schedule, etc.) that name too many
 // routes to be about this particular stop — the caller decides where those
 // belong instead of the per-station alert list.
+var MAX_HELPER_OUTPUT = (352 << 10) + 64
+
 function parseArrivals(raw) {
+  if (String(raw || "").length > MAX_HELPER_OUTPUT) return { ok: false, error: "output-too-large", detail: "" }
   var text = String(raw || "").replace(/^\s+|\s+$/g, "")
   if (text === "") return { ok: false, error: "empty", detail: "" }
 
@@ -44,13 +55,15 @@ function parseArrivals(raw) {
     feedTimestamp: Number(data.feedTimestamp) || 0,
     failedFeeds: Array.isArray(data.failedFeeds) ? data.failedFeeds : [],
     anomalies: Array.isArray(data.anomalies) ? data.anomalies.map(String) : [],
-    ride: data.ride || null
+    ride: data.ride || null,
+    followed: data.followed || null
   }
 }
 
 // Parses bin/nyc-subway-lines' stdout: { ok: true, lines } or
 // { ok: false, error, detail }. Never throws.
 function parseLines(raw) {
+  if (String(raw || "").length > MAX_HELPER_OUTPUT) return { ok: false, error: "output-too-large", detail: "" }
   var text = String(raw || "").replace(/^\s+|\s+$/g, "")
   if (text === "") return { ok: false, error: "empty", detail: "" }
   var data
@@ -90,20 +103,21 @@ function rideBarText(ride, alightName, nowSeconds) {
     + (stops >= 0 ? " · " + (stops === 0 ? "next stop" : (stops + 1) + " stops") : "")
 }
 
-// Builds the argv for bin/nyc-subway-trip. originPairs and
+// Builds the stdin line for bin/nyc-subway-trip. originPairs and
 // destPairs are already-joined "stopId:feedGroup,..." strings (one entry per
 // line grouping at that station complex); transferPairs is an already-joined
 // "entryStop:entryFeed:exitStop:exitFeed,..." string of candidate one-
 // transfer bridge points — both built by the caller from
 // Stations.searchStationGroups / Stations.transferCandidates.
-function tripPollCommand(scriptPath, originPairs, destPairs, transferPairs) {
-  return ["python3", String(scriptPath), String(originPairs), String(destPairs), String(transferPairs)]
+function tripInput(originPairs, destPairs, transferPairs) {
+  return helperInput([originPairs, destPairs, transferPairs])
 }
 
 // Parses bin/nyc-subway-trip's stdout. Returns { ok: true, direct, transfers }
 // (either list may be empty — empty-both means no direct-or-one-transfer
 // route was found) or { ok: false, error, detail }. Never throws.
 function parseTripResult(raw) {
+  if (String(raw || "").length > MAX_HELPER_OUTPUT) return { ok: false, error: "output-too-large", detail: "" }
   var text = String(raw || "").replace(/^\s+|\s+$/g, "")
   if (text === "") return { ok: false, error: "empty", detail: "" }
 
@@ -158,8 +172,32 @@ function arrivePhrase(minutes) {
 // sentence form what the bar's compact "[4] now" abbreviates, for the bar
 // tooltip (see Panel.qml's tooltipText).
 function nextArrivalPhrase(route, minutes) {
-  var m = Math.max(0, Math.round(Number(minutes) || 0))
-  return "route " + route + ", arriving " + (m === 0 ? "now" : "in " + formatMinutes(minutes))
+  return "route " + route + ", arriving " + inMinutesPhrase(minutes)
+}
+
+function inMinutesPhrase(minutes) {
+  var text = formatMinutes(minutes)
+  return text === "now" ? text : "in " + text
+}
+
+function railPosition(epochs, start, now, segment, reportedRow, status) {
+  var p = epochs[start] > now ? start - Math.min(1, (epochs[start] - now) / segment) : start
+  for (var k = start; k < epochs.length - 1; k++) {
+    if (now < epochs[k + 1]) {
+      var span = epochs[k + 1] - epochs[k]
+      if (now > epochs[k] && span > 0) p = k + (now - epochs[k]) / span
+      break
+    }
+    p = k + 1
+  }
+  if (reportedRow >= 0 && status === "at") p = Math.min(Math.max(p, reportedRow), reportedRow + 0.9)
+  else if (reportedRow >= 0 && status === "approaching") p = Math.min(Math.max(p, reportedRow - 1), reportedRow - 0.1)
+  return Math.max(p, -0.35)
+}
+
+function awayPhrase(minutes) {
+  var text = formatMinutes(minutes)
+  return text === "now" ? "arriving" : text + " away"
 }
 
 // "1:21 PM" style clock time, for a per-stop list stretching far enough out
@@ -358,7 +396,7 @@ function truncateName(name, maxLength) {
 }
 
 function routeGlyph(route) {
-  return circledGlyph(route) || ("[" + route + "]")
+  return circledGlyph(route) || ("[" + String(route || "").slice(0, 4) + "]")
 }
 
 function barText(stationLabel, stopId, arrivals, alertCount, options) {
@@ -394,6 +432,8 @@ function errorText(error) {
     case "helper-timeout": return "The MTA feed took too long and was stopped"
     case "parse-failed": return "Unexpected feed format"
     case "bad-json": return "Helper script output was not valid JSON"
+    case "bad-input": return "The helper script received a malformed request"
+    case "output-too-large": return "The MTA's data was too large to show and was ignored"
     case "empty": return "No response from the helper script"
     default: return "No data yet"
   }
@@ -403,6 +443,19 @@ function errorText(error) {
 // text must show as written, never as a tag or a live link.
 function escapeMarkup(text) {
   return String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+}
+
+function notificationText(text, maxLength) {
+  return truncateName(String(text || "").replace(/^\s+|\s+$/g, ""), maxLength)
+    .replace(/^-+/, function(dashes) { return dashes.replace(/-/g, "‐") })
+}
+
+function notificationCommand(title, body, urgency, pluginId) {
+  var command = ["omarchy-notification-send", "--app-name", "OMTArchy", "-u", urgency || "normal",
+    notificationText(title, 120) || "OMTArchy"]
+  var description = escapeMarkup(notificationText(body, 500))
+  if (description !== "") command.push(description)
+  return command.concat(["--exec", "omarchy-shell", "shell", "summon", String(pluginId), "{}"])
 }
 
 // Same errors as errorText, but for the trip planner's own context (its
@@ -415,13 +468,17 @@ function tripErrorText(error) {
 
 if (typeof module !== "undefined") {
   module.exports = {
-    pollCommand: pollCommand,
+    helperCommand: helperCommand,
+    pollInput: pollInput,
+    helperInput: helperInput,
+    tripInput: tripInput,
+    notificationText: notificationText,
+    notificationCommand: notificationCommand,
     parseArrivals: parseArrivals,
     parseLines: parseLines,
     lineStatusText: lineStatusText,
     delayPhrase: delayPhrase,
     rideBarText: rideBarText,
-    tripPollCommand: tripPollCommand,
     liveArrivals: liveArrivals,
     parseTripResult: parseTripResult,
     formatMinutes: formatMinutes,
@@ -431,6 +488,9 @@ if (typeof module !== "undefined") {
     truncateName: truncateName,
     departPhrase: departPhrase,
     nextArrivalPhrase: nextArrivalPhrase,
+    inMinutesPhrase: inMinutesPhrase,
+    awayPhrase: awayPhrase,
+    railPosition: railPosition,
     arrivePhrase: arrivePhrase,
     formatClockTime: formatClockTime,
     directionTabLabel: directionTabLabel,

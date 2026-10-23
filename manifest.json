@@ -2,15 +2,17 @@
   "schemaVersion": 1,
   "id": "tirade.nyc-subway",
   "name": "OMTArchy - NYC Subway MTA",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "author": "tirade",
   "license": "MIT",
   "description": "Live NYC subway arrivals for any station from the MTA's GTFS-realtime feeds — no API key needed. Shows the next trains in the bar and a full detail popup: whole-station boards (even Times Sq, across every feed), each train's real destination, service alerts split from planned work, elevator and escalator outages, a trip planner that knows when an express transfer beats riding direct, per-train stop lists, leave-now reminders, and favorite stations with automatic AM/PM commute switching.",
   "kinds": [
-    "bar-widget"
+    "bar-widget",
+    "service"
   ],
   "entryPoints": {
-    "barWidget": "BarWidget.qml"
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
   },
   "barWidget": {
     "displayName": "OMTArchy - NYC Subway MTA",
@@ -30,7 +32,8 @@
       "barArrivals": 2,
       "commuteAuto": false,
       "commuteSwitchHour": 12,
-      "alertNotify": "commute"
+      "alertNotify": "commute",
+      "notificationDetails": false
     },
     "schema": [
       {
@@ -90,11 +93,11 @@
         "key": "pollIntervalMs",
         "type": "integer",
         "label": "Refresh interval (ms)",
-        "min": 10000,
+        "min": 30000,
         "max": 120000,
         "step": 5000,
         "defaultValue": 30000,
-        "description": "MTA feeds update roughly every 30s; polling faster than that just burns CPU."
+        "description": "MTA feeds update roughly every 30s, so that's also the shortest interval allowed."
       },
       {
         "key": "barArrivals",
@@ -144,6 +147,13 @@
         ],
         "defaultValue": "commute",
         "description": "Desktop notification when a new delay appears on this station's selected lines. commute: only while commute mode has you on your AM or PM station. always: whatever station is tracked."
+      },
+      {
+        "key": "notificationDetails",
+        "type": "boolean",
+        "label": "Detailed notifications",
+        "defaultValue": false,
+        "description": "Off: notifications only say that something happened (\"Time to leave for your train\"), and clicking one opens the popup. On: they also name your station, line and stop. Notification text is handed to Omarchy's notification command as program arguments, which other accounts on a shared computer may be able to see while it runs."
       },
       {
         "key": "label",

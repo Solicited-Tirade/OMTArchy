@@ -5,8 +5,8 @@ MTA GTFS-realtime data: direct rides, plus the best single-transfer options
 platform to a 2/3 express). Station-to-station only — no walking/driving
 directions.
 
-Usage:
-  nyc-subway-trip <originPairs> <destPairs> <transferPairs>
+Usage, reading one line from stdin: a JSON array of
+  <originPairs> <destPairs> <transferPairs>
 
   originPairs    "stopId:feedGroup,stopId:feedGroup,..." — every stop_id
                  that's part of the origin complex (one per line grouping).
@@ -31,8 +31,6 @@ is one physical division), so a direct connection is only possible between
 stop_ids that share a feed. That's also why a transfer's two legs are always
 each entirely on one feed.
 """
-import json
-import sys
 import time
 
 import mta_feed
@@ -49,8 +47,7 @@ MIN_TRANSFER_SECONDS = 30
 TRANSFER_MUST_SAVE_SECONDS = 120
 
 
-def fail(reason, detail=""):
-    print(json.dumps({"error": reason, "detail": str(detail)}))
+fail = mta_feed.fail
 
 
 def parse_pairs(text):
@@ -161,13 +158,16 @@ def best_direct(indexes, from_pairs, to_pairs, now, not_before=0, exclude_trip=N
 
 
 def main():
-    args = sys.argv[1:]
+    mta_feed.limit_memory()
+    mta_feed.limit_runtime(mta_feed.HELPER_SECONDS)
+    try:
+        args = mta_feed.read_args()
+    except ValueError as e:
+        return fail("bad-input", e)
     origin_pairs = parse_pairs(args[0] if len(args) > 0 else "")
     dest_pairs = parse_pairs(args[1] if len(args) > 1 else "")
     transfer_pairs = parse_transfer_pairs(args[2] if len(args) > 2 else "")
 
-    mta_feed.limit_memory()
-    mta_feed.limit_runtime(mta_feed.HELPER_SECONDS)
     if not origin_pairs or not dest_pairs:
         return fail("no-stop-id")
     if mta_feed.IMPORT_ERROR is not None:
@@ -229,7 +229,7 @@ def main():
         transfers = [t for t in transfers if t["totalAt"] <= cutoff]
     transfers.sort(key=lambda t: t["totalAt"])
 
-    print(json.dumps({"direct": direct, "transfers": transfers[:MAX_TRANSFERS]}))
+    mta_feed.emit({"direct": direct, "transfers": transfers[:MAX_TRANSFERS]})
 
 
 if __name__ == "__main__":

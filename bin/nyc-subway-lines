@@ -14,7 +14,6 @@ not running right now, e.g. the B at night, or the feed is down).
 Fetches all eight subway feeds in parallel, plus the (cached) alerts feed,
 so it's meant to run only while the Lines view is open.
 """
-import json
 import time
 
 import mta_feed
@@ -36,44 +35,19 @@ LINES = [
     ("SI", "SIR", "Staten Island Railway"),
 ]
 
-KIND_ORDER = {"delay": 0, "notice": 1, "planned": 2}
-# Same split as nyc-subway-status's alert_kind.
-NOTICE_TYPES = {"Station Notice", "Boarding Change", "Special Schedule", "Extra Service", "Special Event"}
-
-
-def alert_kind(alert_type):
-    if alert_type.startswith("Planned"):
-        return "planned"
-    if alert_type in NOTICE_TYPES:
-        return "notice"
-    return "delay"
-
-
-def alert_header(alert):
-    for translation in alert.header_text.translation:
-        if translation.language in ("en", ""):
-            return translation.text
-    return alert.header_text.translation[0].text if alert.header_text.translation else ""
-
-
-def alert_is_active(alert, now):
-    if not alert.active_period:
-        return True
-    return any((not p.start or p.start <= now) and (not p.end or p.end >= now) for p in alert.active_period)
+LINE_IDS = {route_id for route_id, _feed, _label in LINES}
 
 
 def main():
     mta_feed.limit_memory()
     mta_feed.limit_runtime(mta_feed.HELPER_SECONDS)
     if mta_feed.IMPORT_ERROR is not None:
-        print(json.dumps({"error": "missing-protobuf", "detail": str(mta_feed.IMPORT_ERROR)}))
-        return
+        return mta_feed.fail("missing-protobuf", mta_feed.IMPORT_ERROR)
 
     feeds = mta_feed.fetch_feeds(mta_feed.FEED_PATHS.keys())
     if all(isinstance(f, Exception) for f in feeds.values()):
         first = next(iter(feeds.values()))
-        print(json.dumps({"error": mta_feed.error_reason(first), "detail": str(first)}))
-        return
+        return mta_feed.fail(mta_feed.error_reason(first), first)
 
     trains = {}
     for feed in feeds.values():
@@ -83,39 +57,42 @@ def main():
             # Assigned trains only: a schedule entry nobody's driving yet
             # doesn't mean the line is running.
             if entity.HasField("trip_update") and mta_feed.extension(entity.trip_update.trip).get(2, [0])[0] == 1:
-                route = entity.trip_update.trip.route_id
-                route = {"6X": "6", "7X": "7", "FX": "F"}.get(route, route)
+                route = mta_feed.base_route(entity.trip_update.trip.route_id)
                 trains[route] = trains.get(route, 0) + 1
 
     alerts_by_route = {}
+    headers_by_route = {}
     try:
         alerts_feed = mta_feed.parse_feed(mta_feed.cached_bytes(mta_feed.ALERTS_URL, "subway-alerts.pb", ALERTS_CACHE_SECONDS), "subway-alerts")
         now = time.time()
         for entity in alerts_feed.entity:
-            if not entity.HasField("alert") or not alert_is_active(entity.alert, now):
+            if not entity.HasField("alert") or not mta_feed.alert_is_active(entity.alert, now):
                 continue
             alert = entity.alert
-            header = alert_header(alert).strip()
+            header = mta_feed.clean_text(mta_feed.english_text(alert.header_text).strip(), "subway-alerts")
             if not header:
                 continue
-            mta_feed.check_text(header, "subway-alerts")
             mercury = mta_feed.extension(alert)
+            period = mta_feed.clean_text(mta_feed.ext_translated_text(mercury, 8), "subway-alerts", mta_feed.MAX_PERIOD_TEXT)
+            if period is None:
+                continue
             item = {
                 "header": header,
-                "kind": alert_kind(mta_feed.ext_text(mercury, 3)),
-                "period": mta_feed.ext_translated_text(mercury, 8),
+                "kind": mta_feed.alert_kind(mta_feed.ext_text(mercury, 3)),
+                "period": period,
             }
             routes = {ie.route_id for ie in alert.informed_entity if ie.route_id and ie.agency_id in ("", "MTASBWY")}
-            for route in {{"6X": "6", "7X": "7", "FX": "F"}.get(r, r) for r in routes}:
-                bucket = alerts_by_route.setdefault(route, [])
-                if all(a["header"] != header for a in bucket):
-                    bucket.append(item)
+            for route in {mta_feed.base_route(r) for r in routes} & LINE_IDS:
+                seen = headers_by_route.setdefault(route, set())
+                if header not in seen:
+                    seen.add(header)
+                    alerts_by_route.setdefault(route, []).append(item)
     except Exception:  # noqa: BLE001 - statuses still useful without alerts
         pass
 
     lines = []
     for route_id, feed_group, label in LINES:
-        alerts = sorted(alerts_by_route.get(route_id, []), key=lambda a: KIND_ORDER[a["kind"]])
+        alerts = sorted(alerts_by_route.get(route_id, []), key=lambda a: mta_feed.KIND_ORDER[a["kind"]])
         count = trains.get(route_id, 0)
         feed_ok = not isinstance(feeds.get(feed_group), Exception)
         if any(a["kind"] == "delay" for a in alerts):
@@ -136,7 +113,13 @@ def main():
             "alerts": alerts[:6],
         })
 
-    print(json.dumps({"lines": lines}))
+    reply = {"lines": lines}
+    for keep in (2, 0):
+        if len(mta_feed.encode(reply)) <= mta_feed.MAX_OUTPUT_BYTES:
+            break
+        for line in lines:
+            line["alerts"] = line["alerts"][:keep]
+    mta_feed.emit(reply)
 
 
 if __name__ == "__main__":

@@ -12,8 +12,19 @@ Item {
   property string fontFamily: Style.font.family
   property int pixelSize: Style.font.bodySmall
   property real dotDiameter: Style.space(6)
+  property color hoverColor: textColor
+
+  signal activated()
 
   height: Style.space(28)
+
+  MouseArea {
+    id: rowArea
+    anchors.fill: parent
+    hoverEnabled: true
+    cursorShape: Qt.PointingHandCursor
+    onClicked: row.activated()
+  }
 
   Row {
     anchors.left: parent.left
@@ -31,7 +42,7 @@ Item {
     Text {
       textFormat: Text.PlainText
       text: row.label
-      color: row.textColor
+      color: rowArea.containsMouse ? row.hoverColor : row.textColor
       font.family: row.fontFamily
       font.pixelSize: row.pixelSize
     }

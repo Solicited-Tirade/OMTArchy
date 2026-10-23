@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 
 // Underlined-on-hover accent text link: "Change", "Plan a Trip", "Help",
 // "Retry", etc. Enlarges its tap target beyond the painted text via a
@@ -12,7 +13,7 @@ Text {
   signal activated()
 
   textFormat: Text.PlainText
-  color: Color.accent
+  color: Commons.Color.accent
   font.underline: linkArea.containsMouse
 
   MouseArea {

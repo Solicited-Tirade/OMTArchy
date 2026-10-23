@@ -17,6 +17,7 @@ Row {
   spacing: Style.space(10)
 
   RoutePill {
+    id: legPill
     route: legRow.route
     diameter: Style.space(28)
     labelFontFamily: legRow.fontFamily
@@ -25,11 +26,14 @@ Row {
   }
 
   Column {
+    width: Math.max(0, legRow.width - legPill.width - legRow.spacing)
     anchors.verticalCenter: parent.verticalCenter
     spacing: Style.space(2)
 
     Text {
       textFormat: Text.PlainText
+      width: parent.width
+      wrapMode: Text.WordWrap
       text: legRow.primaryText
       color: legRow.foreground
       font.family: legRow.fontFamily
@@ -38,6 +42,8 @@ Row {
 
     Text {
       textFormat: Text.PlainText
+      width: parent.width
+      wrapMode: Text.WordWrap
       text: legRow.secondaryText
       color: legRow.dim
       font.family: legRow.fontFamily

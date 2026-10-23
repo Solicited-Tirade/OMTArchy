@@ -20,7 +20,8 @@ match; the trailing route-pattern code doesn't. trip_key() keeps just the
 parts that match. A key shared by two trips in one day's service is
 ambiguous and dropped rather than guessed.
 
-Usage (internal): python3 mta_schedule.py build <stopId,stopId,...>
+Usage (internal): python3 mta_schedule.py build, reading <stopId,stopId,...>
+from one line of stdin.
 """
 import csv
 import datetime
@@ -40,13 +41,16 @@ GTFS_URL = "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_subway.zip"
 # close enough for lateness and saves re-downloading 6 MB.
 GTFS_MAX_AGE = 7 * 24 * 3600
 # The zip was 5.6 MB (43 MB unpacked, stop_times.txt 36 MB of it) on
-# 2026-10-20. Generous ceilings, so a growing timetable never trips them but
-# a swapped-in zip bomb can't fill the disk or memory during a build.
-GTFS_MAX_ZIP_BYTES = 64 << 20
-GTFS_MAX_UNPACKED_BYTES = 512 << 20
+# 2026-10-20. Ceilings at twice that, so an unexpectedly large zip can't fill
+# the disk or memory during a build.
+GTFS_MAX_ZIP_BYTES = 11 << 20
+GTFS_MAX_UNPACKED_BYTES = 84 << 20
 GTFS_DOWNLOAD_SECONDS = 90
+MAX_INDEX_BYTES = 215 << 10
 # A build that hasn't finished in this long is assumed dead.
 BUILD_LOCK_SECONDS = 180
+BUILD_RETRY_SECONDS = 3600
+BUILD_RETRY_MAX_SECONDS = 86400
 
 CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "omtarchy")
 
@@ -83,21 +87,68 @@ def index_path(stop_ids, day):
     return os.path.join(CACHE_DIR, "schedule-%s-%s.json" % (day.strftime("%Y%m%d"), digest))
 
 
+def cache_dir():
+    try:
+        os.makedirs(os.path.dirname(CACHE_DIR), exist_ok=True)
+    except OSError:
+        return None
+    return mta_feed.private_dir(CACHE_DIR)
+
+
 def load_index(stop_ids):
     """The index for today and these stops, or None if it isn't built yet."""
     day, _midnight = service_day()
     try:
-        with open(index_path(stop_ids, day), encoding="utf-8") as f:
-            return json.load(f)
+        with open(index_path(stop_ids, day), "rb") as f:
+            raw = f.read(MAX_INDEX_BYTES + 1)
+        index = json.loads(raw) if len(raw) <= MAX_INDEX_BYTES else None
     except (OSError, ValueError):
         return None
+    if not isinstance(index, dict) or not isinstance(index.get("midnight"), (int, float)):
+        return None
+    if not all(isinstance(index.get(table, {}), dict) for table in ("today", "yesterday")):
+        return None
+    return index
+
+
+def failure_path():
+    return os.path.join(CACHE_DIR, "build-failures")
+
+
+def build_failures():
+    try:
+        with open(failure_path(), "rb") as f:
+            return max(0, int(f.read(16) or b"0"))
+    except (OSError, ValueError):
+        return 0
+
+
+def build_backed_off():
+    failures = build_failures()
+    if not failures:
+        return False
+    wait = min(BUILD_RETRY_SECONDS * 2 ** min(failures - 1, 10), BUILD_RETRY_MAX_SECONDS)
+    try:
+        return time.time() - os.path.getmtime(failure_path()) < wait
+    except OSError:
+        return False
+
+
+def run_build(stop_ids):
+    mta_feed.write_private(failure_path(), str(build_failures() + 1).encode())
+    build(stop_ids)
+    os.remove(failure_path())
 
 
 def ensure_index(stop_ids):
     """load_index, starting a background build when it's missing."""
+    if not stop_ids or cache_dir() is None:
+        return None
     index = load_index(stop_ids)
-    if index is not None or not stop_ids:
+    if index is not None:
         return index
+    if build_backed_off():
+        return None
     day, _midnight = service_day()
     lock = index_path(stop_ids, day) + ".building"
     try:
@@ -106,13 +157,14 @@ def ensure_index(stop_ids):
     except OSError:
         pass
     try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        open(lock, "w").close()
-        subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "build", ",".join(sorted(stop_ids))],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        mta_feed.write_private(lock, b"")
+        builder = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "build"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        builder.stdin.write((",".join(sorted(stop_ids)) + "\n").encode())
+        builder.stdin.close()
     except OSError:
         pass
     return None
@@ -127,8 +179,9 @@ def delay_minutes(index, realtime_trip_id, stop_id, epoch):
     if key is None:
         return None
     for table, base in (("today", index["midnight"]), ("yesterday", index["midnight"] - 86400)):
-        secs = index.get(table, {}).get(key, {}).get(stop_id)
-        if secs is not None:
+        entry = index.get(table, {}).get(key)
+        secs = entry.get(stop_id) if isinstance(entry, dict) else None
+        if isinstance(secs, int):
             return round((epoch - (base + secs)) / 60)
     return None
 
@@ -143,11 +196,7 @@ def gtfs_zip_path():
     except OSError:
         pass
     raw = mta_feed.fetch_bytes(GTFS_URL, GTFS_DOWNLOAD_SECONDS, GTFS_MAX_ZIP_BYTES)
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    tmp = path + ".%d" % os.getpid()
-    with open(tmp, "wb") as f:
-        f.write(raw)
-    os.replace(tmp, path)
+    mta_feed.write_private(path, raw)
     return path
 
 
@@ -213,12 +262,8 @@ def build(stop_ids):
                         continue
                     tables[table].setdefault(key, {})[stop] = secs
 
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    path = index_path(stop_ids, day)
-    tmp = path + ".%d" % os.getpid()
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"midnight": midnight, "today": tables["today"], "yesterday": tables["yesterday"]}, f, separators=(",", ":"))
-    os.replace(tmp, path)
+    index = {"midnight": midnight, "today": tables["today"], "yesterday": tables["yesterday"]}
+    mta_feed.write_private(index_path(stop_ids, day), json.dumps(index, separators=(",", ":")).encode())
 
     # Yesterday's indexes are dead weight now.
     for name in os.listdir(CACHE_DIR):
@@ -230,14 +275,16 @@ def build(stop_ids):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "build":
+    if len(sys.argv) == 2 and sys.argv[1] == "build":
         mta_feed.limit_memory()
-        # Die before the lock goes stale: otherwise a build stuck on a
-        # hostile server outlives it, and every later poll spawns another.
+        # Die before the lock goes stale: otherwise a build stuck on an
+        # unresponsive server outlives it, and every later poll spawns another.
         mta_feed.limit_runtime(BUILD_LOCK_SECONDS - 10)
-        ids = {s for s in sys.argv[2].split(",") if s}
+        line = sys.stdin.buffer.readline(mta_feed.MAX_INPUT_BYTES + 1)
+        ids = {s for s in line.decode("utf-8", "replace").strip().split(",") if s}
         try:
-            build(ids)
+            if ids and len(line) <= mta_feed.MAX_INPUT_BYTES and cache_dir() is not None:
+                run_build(ids)
         finally:
             try:
                 os.remove(index_path(ids, service_day()[0]) + ".building")

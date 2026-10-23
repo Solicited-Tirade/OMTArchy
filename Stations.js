@@ -204,6 +204,23 @@ function stationById(id) {
   return STATION_INDEX[id] || null
 }
 
+var BOROUGH_NAMES = { "M": "Manhattan", "Bk": "Brooklyn", "Q": "Queens", "Bx": "Bronx", "SI": "Staten Island" }
+var BOROUGHS_BY_NAME = null
+
+function displayName(station) {
+  if (!station) return ""
+  if (!BOROUGHS_BY_NAME) {
+    BOROUGHS_BY_NAME = {}
+    for (var i = 0; i < STATIONS.length; i++) {
+      var seen = BOROUGHS_BY_NAME[STATIONS[i].name] || (BOROUGHS_BY_NAME[STATIONS[i].name] = {})
+      seen[STATIONS[i].borough] = true
+    }
+  }
+  var boroughs = BOROUGHS_BY_NAME[station.name]
+  var shared = boroughs && Object.keys(boroughs).length > 1
+  return shared && BOROUGH_NAMES[station.borough] ? station.name + " (" + BOROUGH_NAMES[station.borough] + ")" : station.name
+}
+
 // The widget's stopId setting is usually one GTFS stop_id, but a whole-
 // complex pick (see stopTokensForPills) sets it to a comma-joined list of
 // every platform at the station, each optionally suffixed with the feed
@@ -416,6 +433,7 @@ if (typeof module !== "undefined") {
     searchStations: searchStations,
     searchStationGroups: searchStationGroups,
     stationById: stationById,
+    displayName: displayName,
     transferCandidates: transferCandidates,
     transferSeconds: transferSeconds,
     parseStopTokens: parseStopTokens,

@@ -45,25 +45,18 @@ import math
 import os
 import re
 import sys
-import urllib.request
 import zipfile
 from collections import Counter, defaultdict
 
-# web.mta.info/developers/data/nyct/subway/google_transit.zip now just
-# 301-redirects here.
-GTFS_URL = "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_subway.zip"
+import mta_feed
+from mta_schedule import GTFS_DOWNLOAD_SECONDS, GTFS_MAX_UNPACKED_BYTES, GTFS_MAX_ZIP_BYTES, GTFS_URL
+
 STATIONS_JS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Stations.js")
 
 # Any candidate predecessor edge seen fewer than this many times across the
 # whole schedule is treated as noise (a one-off reroute/GO artifact) rather
 # than a real, regularly-served physical adjacency.
 MIN_EDGE_COUNT = 2
-
-
-def fetch_gtfs_zip(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "omarchy-nyc-subway-plugin/1.0"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return resp.read()
 
 
 def find_matching_bracket(s, start):
@@ -219,12 +212,16 @@ def main():
 
     if args.zip_path:
         with open(args.zip_path, "rb") as f:
-            raw = f.read()
+            raw = f.read(GTFS_MAX_ZIP_BYTES + 1)
+        if len(raw) > GTFS_MAX_ZIP_BYTES:
+            sys.exit("%s is over the %d-byte GTFS zip limit" % (args.zip_path, GTFS_MAX_ZIP_BYTES))
     else:
         print("Fetching %s ..." % GTFS_URL, file=sys.stderr)
-        raw = fetch_gtfs_zip(GTFS_URL)
+        raw = mta_feed.fetch_bytes(GTFS_URL, GTFS_DOWNLOAD_SECONDS, GTFS_MAX_ZIP_BYTES)
 
     with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        if sum(info.file_size for info in zf.infolist()) > GTFS_MAX_UNPACKED_BYTES:
+            sys.exit("GTFS zip unpacks to more than %d bytes" % GTFS_MAX_UNPACKED_BYTES)
         predecessor = compute_predecessor_edges(zf)
         positions, gtfs_names = load_stop_positions_and_names(zf)
         transfers = load_transfer_seconds(zf)

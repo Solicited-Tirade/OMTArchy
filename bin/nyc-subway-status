@@ -3,7 +3,8 @@
 currently-active service alerts for the station's lines, and its elevator/
 escalator outages, as JSON.
 
-Usage: nyc-subway-status <feedGroup> <stopId> <direction> <routeFilter> <alertRoutes> [<complexIds>] [<ride>]
+Usage: nyc-subway-status, reading one line from stdin: a JSON array of
+<feedGroup> <stopId> <direction> <routeFilter> <alertRoutes> [<complexIds>] [<ride>] [<follow>]
 
   feedGroup    one of 1234567S, ACE, BDFM, G, JZ, NQRW, L, SIR — the feed for
                any stopId token below that doesn't name its own.
@@ -22,22 +23,25 @@ Usage: nyc-subway-status <feedGroup> <stopId> <direction> <routeFilter> <alertRo
   ride         "feedGroup|tripId|alightStopId" for a train the rider is on
                ("" or omitted for none): reports how far it is from their
                stop, from the same fetch.
+  follow       "feedGroup|tripId" for a train open in the popup ("" or
+               omitted for none): reports where it is and its remaining
+               stops, even after it has passed the tracked station.
 
 Prints {"arrivals": [{"route","routeId","express","assigned","tripId","feed",
 "dir","minutes","epoch","destStopId","stopsAway","posStopId","posStatus",
 "delayMin","stops"}, ...], "alerts": [{"routes","header","kind","type",
 "period"}, ...], "generalAlerts": [...], "outages": [{"type","serving",
 "returns","reason","ada"}, ...], "ride": {"found","alightEpoch","stopsLeft",
-"nextStopId","posStatus"} or null, "feedTimestamp": <epoch>, "failedFeeds":
+"nextStopId","posStatus"} or null, "followed": {"found","tripId","posStatus",
+"posStopId","stops"} or null, "feedTimestamp": <epoch>, "failedFeeds":
 [...], "anomalies": [...]}, or {"error": "..."} on failure. anomalies are
 mta_feed's sanity-check findings: ways the MTA's data looked unlike itself
-this poll (see mta_feed's "Expectations"), shown but not acted on. Routes in and out use
+this poll (see mta_feed's "Expectations"), left out or refused. Routes in and out use
 Stations.js's spelling ("S", "SIR", plain 6/7/F) — see mta_feed.py for the
 translation to live-feed route_ids. No API key needed: MTA subway
 GTFS-realtime feeds have been open since 2019.
 """
-import json
-import sys
+import heapq
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -52,10 +56,12 @@ MAX_ALERTS = 5
 # Planned work is a separate, collapsed section in the popup, and a busy
 # weekend easily has more of it than of real-time problems.
 MAX_PLANNED = 8
+MAX_OUTAGES = 20
 # Stops embedded per arrival for "tap a train, see its whole trip" — a full
 # end-to-end trip rarely needs more than this to be useful, and it bounds
 # the response size across up to MAX_ROWS arrivals each carrying their own list.
 MAX_STOPS_PER_TRIP = 25
+MAX_FOLLOWED_STOPS = 40
 # The alerts feed is the biggest download here and changes far less often
 # than arrivals, so it's cached on disk and refetched at most this often
 # rather than on every 30s arrivals poll.
@@ -66,8 +72,7 @@ OUTAGES_CACHE_SECONDS = 300
 EQUIPMENT_CACHE_SECONDS = 24 * 3600
 
 
-def fail(reason, detail=""):
-    print(json.dumps({"error": reason, "detail": str(detail)}))
+fail = mta_feed.fail
 
 
 # VehiclePosition.current_status -> how the popup phrases where a train is.
@@ -82,9 +87,21 @@ def vehicle_positions(feed):
         if not entity.HasField("vehicle"):
             continue
         v = entity.vehicle
-        if v.trip.trip_id and v.stop_id:
-            out[v.trip.trip_id] = (POSITION_STATUS.get(v.current_status, ""), mta_feed.split_stop_id(v.stop_id)[0])
+        parent = mta_feed.split_stop_id(v.stop_id)[0]
+        if v.trip.trip_id and parent and mta_feed.is_station(parent):
+            out[v.trip.trip_id] = (POSITION_STATUS.get(v.current_status, ""), parent)
     return out
+
+
+def station_updates(stop_time_updates):
+    return [u for u in stop_time_updates if u.stop_id and mta_feed.is_station(mta_feed.split_stop_id(u.stop_id)[0])]
+
+
+def train_index(updates, at):
+    for j, u in enumerate(updates):
+        if at and mta_feed.split_stop_id(u.stop_id)[0] == at:
+            return j
+    return None
 
 
 # Lateness under this is noise (rounding, dwell times); over the cap it's
@@ -94,9 +111,9 @@ MAX_DELAY_SHOWN = 45
 
 
 def arrivals_from_feed(feed, feed_group, stop_ids, direction, wanted_routes, now, schedule):
-    arrivals = []
-    positions = vehicle_positions(feed)
-    for entity in feed.entity:
+    matches = []
+    entities = feed.entity
+    for n, entity in enumerate(entities):
         if not entity.HasField("trip_update"):
             continue
         trip_update = entity.trip_update
@@ -104,25 +121,9 @@ def arrivals_from_feed(feed, feed_group, stop_ids, direction, wanted_routes, now
         if wanted_routes and route_id not in wanted_routes:
             continue
 
-        stop_time_updates = trip_update.stop_time_update
-        if not stop_time_updates:
-            continue
-        # The feed has no headsign, but a trip's last stop_time_update is
-        # where this train actually ends — which is what tells a Lefferts
-        # Blvd A apart from a Far Rockaway A, or a short-turning 4 or 6.
-        dest_stop_id = mta_feed.split_stop_id(stop_time_updates[-1].stop_id)[0]
-        # An unassigned trip is only a schedule entry: no physical train has
-        # been put on it yet, so it may never run. Mostly trips that haven't
-        # left their terminal.
-        assigned = mta_feed.extension(trip_update.trip).get(2, [0])[0] == 1
-        trip_id = trip_update.trip.trip_id
-        pos_status, pos_stop = positions.get(trip_id, ("", ""))
-
+        stop_time_updates = station_updates(trip_update.stop_time_update)
         for i, stop_time_update in enumerate(stop_time_updates):
-            sid = stop_time_update.stop_id
-            if not sid:
-                continue
-            parent, dir_suffix = mta_feed.split_stop_id(sid)
+            parent, dir_suffix = mta_feed.split_stop_id(stop_time_update.stop_id)
             if parent not in stop_ids:
                 continue
             # This train terminates here: nobody can board it, so it
@@ -136,52 +137,75 @@ def arrivals_from_feed(feed, feed_group, stop_ids, direction, wanted_routes, now
             if when is None:
                 continue
 
-            minutes = round((when - now) / 60)
-            if minutes < 0:
+            if round((when - now) / 60) < 0:
                 continue
+            matches.append((when, n, i))
 
-            # The rest of this trip from here on — same list a commuter
-            # sees in the reference app when they tap a specific train:
-            # "board here, then these are the next stops." Starts with this
-            # stop itself (i.e. "board here"), capped so an end-to-end trip
-            # can't bloat the response for a widget that mostly cares about
-            # the next handful of stops.
-            stops = []
-            for later in stop_time_updates[i:i + MAX_STOPS_PER_TRIP]:
-                later_when = mta_feed.stop_time(later)
-                if later_when is None or not later.stop_id:
-                    continue
-                stops.append({
-                    "stopId": mta_feed.split_stop_id(later.stop_id)[0],
-                    "minutes": max(0, round((later_when - now) / 60)),
-                    "epoch": later_when,
-                })
+    positions = vehicle_positions(feed) if matches else {}
+    rows = (arrival_row(entities[n].trip_update, i, when, feed_group, now, positions, schedule)
+            for when, n, i in heapq.nsmallest(MAX_ROWS, matches))
+    return [row for row in rows if row is not None]
 
-            delay = mta_schedule.delay_minutes(schedule, trip_id, sid, when)
-            if delay is not None and not (MIN_DELAY_SHOWN <= delay <= MAX_DELAY_SHOWN):
-                delay = None
 
-            arrivals.append({
-                "route": mta_feed.display_route(route_id),
-                "routeId": route_id,
-                "express": route_id in mta_feed.EXPRESS_ROUTES,
-                "assigned": assigned,
-                "tripId": trip_id,
-                "feed": feed_group,
-                "dir": dir_suffix,
-                "minutes": minutes,
-                "epoch": when,
-                "destStopId": dest_stop_id,
-                # Stops the train still makes before this one: 0 = this is
-                # its next stop. Where it is right now, when the train
-                # reports it: "at"/"approaching" posStopId.
-                "stopsAway": i,
-                "posStopId": pos_stop if assigned else "",
-                "posStatus": pos_status if assigned else "",
-                "delayMin": delay,
-                "stops": stops,
-            })
-    return arrivals
+def arrival_row(trip_update, i, when, feed_group, now, positions, schedule):
+    stop_time_updates = station_updates(trip_update.stop_time_update)
+    route_id = trip_update.trip.route_id
+    trip_id = trip_update.trip.trip_id
+    sid = stop_time_updates[i].stop_id
+    # The feed has no headsign, but a trip's last stop_time_update is
+    # where this train actually ends — which is what tells a Lefferts
+    # Blvd A apart from a Far Rockaway A, or a short-turning 4 or 6.
+    dest_stop_id = mta_feed.split_stop_id(stop_time_updates[-1].stop_id)[0]
+    # An unassigned trip is only a schedule entry: no physical train has
+    # been put on it yet, so it may never run. Mostly trips that haven't
+    # left their terminal.
+    assigned = mta_feed.extension(trip_update.trip).get(2, [0])[0] == 1
+    pos_status, pos_stop = positions.get(trip_id, ("", ""))
+    at = train_index(stop_time_updates, pos_stop) if assigned else None
+    if at is not None and at > i:
+        return None
+
+    # The rest of this trip from here on — same list a commuter
+    # sees in the reference app when they tap a specific train:
+    # "board here, then these are the next stops." Starts with this
+    # stop itself (i.e. "board here"), capped so an end-to-end trip
+    # can't bloat the response for a widget that mostly cares about
+    # the next handful of stops.
+    stops = []
+    for later in stop_time_updates[i:i + MAX_STOPS_PER_TRIP]:
+        later_when = mta_feed.stop_time(later)
+        if later_when is None:
+            continue
+        stops.append({
+            "stopId": mta_feed.split_stop_id(later.stop_id)[0],
+            "minutes": max(0, round((later_when - now) / 60)),
+            "epoch": later_when,
+        })
+
+    delay = mta_schedule.delay_minutes(schedule, trip_id, sid, when)
+    if delay is not None and not (MIN_DELAY_SHOWN <= delay <= MAX_DELAY_SHOWN):
+        delay = None
+
+    return {
+        "route": mta_feed.display_route(route_id),
+        "routeId": route_id,
+        "express": route_id in mta_feed.EXPRESS_ROUTES,
+        "assigned": assigned,
+        "tripId": trip_id,
+        "feed": feed_group,
+        "dir": mta_feed.split_stop_id(sid)[1],
+        "minutes": round((when - now) / 60),
+        "epoch": when,
+        "destStopId": dest_stop_id,
+        # Stops the train still makes before this one: 0 = this is
+        # its next stop. Where it is right now, when the train
+        # reports it: "at"/"approaching" posStopId.
+        "stopsAway": i - at if at is not None else i + (1 if pos_status == "at" else 0),
+        "posStopId": pos_stop if assigned else "",
+        "posStatus": pos_status if assigned else "",
+        "delayMin": delay,
+        "stops": stops,
+    }
 
 
 def fetch_arrivals(feeds, stops_by_feed, direction, route_filter, schedule):
@@ -210,50 +234,11 @@ def fetch_arrivals(feeds, stops_by_feed, direction, route_filter, schedule):
     return arrivals[:MAX_ROWS], min(timestamps), failed
 
 
-def alert_is_active(alert, now):
-    periods = alert.active_period
-    if not periods:
-        return True  # no window given: treat as always active
-    for p in periods:
-        start_ok = (not p.start) or p.start <= now
-        end_ok = (not p.end) or p.end >= now
-        if start_ok and end_ok:
-            return True
-    return False
-
-
-def alert_header(alert):
-    for translation in alert.header_text.translation:
-        if translation.language in ("en", ""):
-            return translation.text
-    if alert.header_text.translation:
-        return alert.header_text.translation[0].text
-    return ""
-
-
-# The MTA's own alert_type (MercuryAlert extension) -> how the popup groups
-# it. "Planned - ..." is scheduled work (weekend reroutes, skipped stops),
-# known days ahead and not worth a bar badge; notices are informational.
-# Anything else — including types this list doesn't know yet — is treated
-# as a live problem, the safe default.
-NOTICE_TYPES = {"Station Notice", "Boarding Change", "Special Schedule", "Extra Service", "Special Event"}
-
-
-def alert_kind(alert_type):
-    if alert_type.startswith("Planned"):
-        return "planned"
-    if alert_type in NOTICE_TYPES:
-        return "notice"
-    return "delay"
-
-
 # An alert naming this many distinct routes (out of ~24 subway routes total)
 # is a system-wide notice (holiday/weekend schedule, systemwide advisory) —
 # not something specific to the station being viewed. A real service
 # disruption almost never spans this many unrelated lines at once.
 GENERAL_ALERT_ROUTE_THRESHOLD = 8
-
-KIND_ORDER = {"delay": 0, "notice": 1, "planned": 2}
 
 
 def fetch_alerts(alert_routes, feed_group):
@@ -282,22 +267,22 @@ def fetch_alerts(alert_routes, feed_group):
         }
         if not routes or not (routes & wanted):
             continue
-        if not alert_is_active(alert, now):
+        if not mta_feed.alert_is_active(alert, now):
             continue
-        header = alert_header(alert).strip()
+        header = mta_feed.clean_text(mta_feed.english_text(alert.header_text).strip(), "subway-alerts")
         if not header or header in seen_headers:
             continue
         seen_headers.add(header)
 
         mercury = mta_feed.extension(alert)
-        alert_type = mta_feed.ext_text(mercury, 3)
-        period = mta_feed.ext_translated_text(mercury, 8)
-        mta_feed.check_text(header, "subway-alerts")
-        mta_feed.check_text(period, "subway-alerts")
+        alert_type = mta_feed.clean_text(mta_feed.ext_text(mercury, 3), "subway-alerts", mta_feed.MAX_TYPE_TEXT) or ""
+        period = mta_feed.clean_text(mta_feed.ext_translated_text(mercury, 8), "subway-alerts", mta_feed.MAX_PERIOD_TEXT)
+        if period is None:
+            continue
         item = {
             "routes": sorted({mta_feed.display_route(r) for r in routes & wanted}),
             "header": header,
-            "kind": alert_kind(alert_type),
+            "kind": mta_feed.alert_kind(alert_type),
             "type": alert_type,
             "period": period,
         }
@@ -306,7 +291,7 @@ def fetch_alerts(alert_routes, feed_group):
         else:
             alerts.append(item)
 
-    alerts.sort(key=lambda a: KIND_ORDER[a["kind"]])
+    alerts.sort(key=lambda a: mta_feed.KIND_ORDER[a["kind"]])
     live = [a for a in alerts if a["kind"] != "planned"][:MAX_ALERTS]
     planned = [a for a in alerts if a["kind"] == "planned"][:MAX_PLANNED]
     return live + planned, general[:MAX_ALERTS]
@@ -327,7 +312,11 @@ def fetch_outages(complex_ids):
         return []
 
     equipment = mta_feed.load_json_list(mta_feed.cached_bytes(mta_feed.EQUIPMENT_URL, "ene-equipment.json", EQUIPMENT_CACHE_SECONDS), "ene-equipment")
-    complex_of = {e.get("equipmentno"): str(e.get("stationcomplexid", "")) for e in equipment}
+    complex_of = {}
+    for e in equipment:
+        equipment_no = mta_feed.json_text(e, "equipmentno")
+        if equipment_no:
+            complex_of[equipment_no] = mta_feed.json_text(e, "stationcomplexid")
     outages = mta_feed.load_json_list(mta_feed.cached_bytes(mta_feed.OUTAGES_URL, "ene-outages.json", OUTAGES_CACHE_SECONDS), "ene-outages")
 
     out = []
@@ -335,24 +324,26 @@ def fetch_outages(complex_ids):
     for o in outages:
         if o.get("isupcomingoutage") == "Y":
             continue  # scheduled for later, not out right now
-        equipment_no = o.get("equipment")
-        if complex_of.get(equipment_no) not in wanted or equipment_no in seen:
+        equipment_no = mta_feed.json_text(o, "equipment")
+        if not equipment_no or complex_of.get(equipment_no) not in wanted or equipment_no in seen:
             continue
         seen.add(equipment_no)
-        item = {
+        serving = mta_feed.clean_text(mta_feed.json_text(o, "serving").strip(), "ene-outages", mta_feed.MAX_SERVING_TEXT)
+        returns = mta_feed.clean_text(format_return(mta_feed.json_text(o, "estimatedreturntoservice")), "ene-outages", mta_feed.MAX_OUTAGE_NOTE_TEXT)
+        reason = mta_feed.clean_text(mta_feed.json_text(o, "reason").strip(), "ene-outages", mta_feed.MAX_OUTAGE_NOTE_TEXT)
+        if None in (serving, returns, reason):
+            continue
+        out.append({
             "type": "elevator" if o.get("equipmenttype") == "EL" else "escalator",
-            "serving": str(o.get("serving") or "").strip(),
-            "returns": format_return(str(o.get("estimatedreturntoservice") or "")),
-            "reason": str(o.get("reason") or "").strip(),
+            "serving": serving,
+            "returns": returns,
+            "reason": reason,
             "ada": o.get("ADA") == "Y",
-        }
-        for text in (item["serving"], item["returns"], item["reason"]):
-            mta_feed.check_text(text, "ene-outages")
-        out.append(item)
+        })
     # Elevators first: an elevator outage can make a station unusable for
     # some riders, an escalator outage just means stairs.
     out.sort(key=lambda o: (o["type"] != "elevator", not o["ada"]))
-    return out
+    return out[:MAX_OUTAGES]
 
 
 def ride_status(feeds, ride):
@@ -369,19 +360,46 @@ def ride_status(feeds, ride):
     for entity in feed.entity:
         if not entity.HasField("trip_update") or entity.trip_update.trip.trip_id != trip_id:
             continue
-        updates = [u for u in entity.trip_update.stop_time_update if u.stop_id]
+        updates = station_updates(entity.trip_update.stop_time_update)
+        status, at = vehicle_positions(feed).get(trip_id, ("", ""))
+        j = train_index(updates, at)
+        ahead = 0 if j is None else (j + 1 if status == "at" else j)
         for i, u in enumerate(updates):
             if mta_feed.split_stop_id(u.stop_id)[0] == alight:
-                status, stop = vehicle_positions(feed).get(trip_id, ("", ""))
+                if ahead > i + 1:
+                    break
                 return {
                     "found": True,
                     "alightEpoch": mta_feed.stop_time(u),
-                    "stopsLeft": i,
-                    "nextStopId": mta_feed.split_stop_id(updates[0].stop_id)[0],
+                    "stopsLeft": max(0, i - ahead),
+                    "nextStopId": mta_feed.split_stop_id(updates[min(ahead, i)].stop_id)[0],
                     "posStatus": status,
                 }
         break
     return {"found": False}
+
+
+def follow_status(feeds, follow):
+    parts = follow.split("|")
+    if len(parts) != 2:
+        return None
+    feed_group, trip_id = parts
+    feed = feeds.get(feed_group)
+    if feed is None or isinstance(feed, Exception):
+        return None
+    for entity in feed.entity:
+        if not entity.HasField("trip_update") or entity.trip_update.trip.trip_id != trip_id:
+            continue
+        updates = station_updates(entity.trip_update.stop_time_update)
+        status, at = vehicle_positions(feed).get(trip_id, ("", ""))
+        start = train_index(updates, at) or 0
+        stops = []
+        for u in updates[start:start + MAX_FOLLOWED_STOPS]:
+            when = mta_feed.stop_time(u)
+            if when is not None:
+                stops.append({"stopId": mta_feed.split_stop_id(u.stop_id)[0], "epoch": when})
+        return {"found": True, "tripId": trip_id, "posStatus": status, "posStopId": at, "stops": stops}
+    return {"found": False, "tripId": trip_id}
 
 
 def best_effort(future, empty):
@@ -392,7 +410,12 @@ def best_effort(future, empty):
 
 
 def main():
-    args = sys.argv[1:]
+    mta_feed.limit_memory()
+    mta_feed.limit_runtime(mta_feed.HELPER_SECONDS)
+    try:
+        args = mta_feed.read_args()
+    except ValueError as e:
+        return fail("bad-input", e)
     feed_group = args[0] if len(args) > 0 else "1234567S"
     stop_id = (args[1] if len(args) > 1 else "").strip()
     direction = args[2] if len(args) > 2 else "both"
@@ -400,9 +423,8 @@ def main():
     alert_routes = args[4] if len(args) > 4 else ""
     complex_ids = args[5] if len(args) > 5 else ""
     ride = args[6] if len(args) > 6 else ""
+    follow = args[7] if len(args) > 7 else ""
 
-    mta_feed.limit_memory()
-    mta_feed.limit_runtime(mta_feed.HELPER_SECONDS)
     if not stop_id:
         return fail("no-stop-id")
     if mta_feed.IMPORT_ERROR is not None:
@@ -412,6 +434,7 @@ def main():
 
     stops_by_feed = mta_feed.parse_stop_tokens(stop_id, feed_group)
     ride_feed = ride.split("|")[0] if ride.count("|") == 2 else ""
+    follow_feed = follow.split("|")[0] if follow.count("|") == 1 else ""
     all_stops = set().union(*stops_by_feed.values()) if stops_by_feed else set()
     # Today's timetable for these stops, if it's been built (see
     # mta_schedule.ensure_index); None just means no lateness this poll.
@@ -427,7 +450,7 @@ def main():
     with ThreadPoolExecutor(max_workers=2) as pool:
         alerts_future = pool.submit(fetch_alerts, alert_routes, feed_group)
         outages_future = pool.submit(fetch_outages, complex_ids)
-        feeds = mta_feed.fetch_feeds(set(stops_by_feed) | ({ride_feed} if ride_feed else set()))
+        feeds = mta_feed.fetch_feeds(set(stops_by_feed) | {f for f in (ride_feed, follow_feed) if f})
         try:
             arrivals, feed_timestamp, failed = fetch_arrivals(feeds, stops_by_feed, direction, route_filter, schedule)
         except Exception as e:  # noqa: BLE001 - report any failure, never crash silently
@@ -438,17 +461,22 @@ def main():
             ride_info = ride_status(feeds, ride) if ride else None
         except Exception:  # noqa: BLE001
             ride_info = None
+        try:
+            followed = follow_status(feeds, follow) if follow else None
+        except Exception:  # noqa: BLE001
+            followed = None
 
-    print(json.dumps({
+    mta_feed.emit({
         "arrivals": arrivals,
         "alerts": alerts,
         "generalAlerts": general_alerts,
         "outages": outages,
         "ride": ride_info,
+        "followed": followed,
         "feedTimestamp": feed_timestamp,
         "failedFeeds": failed,
         "anomalies": mta_feed.anomalies,
-    }))
+    }, optional=("generalAlerts", "outages", "alerts"))
 
 
 if __name__ == "__main__":

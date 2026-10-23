@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 import "Model.js" as Model
 import "Stations.js" as Stations
@@ -16,10 +17,9 @@ Panel {
   property var hostWidget: null
   readonly property var barIdentity: hostWidget || root
 
-  readonly property string helper: Qt.resolvedUrl("bin/nyc-subway-status").toString().replace(/^file:\/\//, "")
   readonly property string tripHelper: Qt.resolvedUrl("bin/nyc-subway-trip").toString().replace(/^file:\/\//, "")
   readonly property string linesHelper: Qt.resolvedUrl("bin/nyc-subway-lines").toString().replace(/^file:\/\//, "")
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.5)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -28,7 +28,8 @@ Panel {
   readonly property string direction: String(setting("direction", "both"))
   readonly property string routeFilter: String(setting("routeFilter", ""))
   readonly property int maxResults: Math.max(1, parseInt(setting("maxResults", 5), 10) || 5)
-  readonly property int pollIntervalMs: Math.max(10000, parseInt(setting("pollIntervalMs", 30000), 10) || 30000)
+  readonly property int pollIntervalMs: Math.max(30000, parseInt(setting("pollIntervalMs", 30000), 10) || 30000)
+  readonly property bool notificationDetails: setting("notificationDetails", false) === true
   readonly property string labelOverride: String(setting("label", ""))
   // Minutes on foot to the station. Trains closer than this are left out of
   // the bar (you can't make them any more), which then also says when to
@@ -102,33 +103,65 @@ Panel {
     return ids.length > 1 ? ids.length + " platforms" : "Stop " + (ids[0] || "")
   }
 
-  property var arrivals: []
+  readonly property var hostedFeed: root.bar && root.bar.shell && typeof root.bar.shell.serviceFor === "function"
+    ? root.bar.shell.serviceFor(root.moduleName) : null
+  readonly property var feed: root.hostedFeed || localFeed.item
+  Loader {
+    id: localFeed
+    active: !!root.bar && !root.hostedFeed
+    source: Qt.resolvedUrl("Service.qml")
+  }
+
+  readonly property var feedRequest: ({
+    key: root.requestKey,
+    feedGroup: root.feedGroup,
+    stopId: root.stopId,
+    direction: root.direction,
+    routeFilter: root.routeFilter,
+    alertRoutes: root.alertRoutes,
+    complexIds: root.complexIds,
+    pollIntervalMs: root.pollIntervalMs
+  })
+  readonly property var feedContext: ({
+    stationLabel: root.stationLabel,
+    walkMinutes: root.walkMinutes,
+    alertNotify: root.alertNotify,
+    onCommuteStation: root.onCommuteStation,
+    notificationDetails: root.notificationDetails
+  })
+  function configureFeed() {
+    if (root.feed) root.feed.configure(root.feedRequest, root.feedContext)
+  }
+  onFeedChanged: configureFeed()
+  onFeedRequestChanged: configureFeed()
+  onFeedContextChanged: configureFeed()
+
+  readonly property var arrivals: root.feed ? root.feed.arrivals : []
   // Alerts specific to this station's routes. System-wide notices (holiday
   // schedules, systemwide advisories) are split out into generalAlerts by
   // the helper script — they aren't about this stop, so they don't belong
   // in the same list; see tooltipText for where they surface instead.
-  property var alerts: []
-  property var generalAlerts: []
+  readonly property var alerts: root.feed ? root.feed.alerts : []
+  readonly property var generalAlerts: root.feed ? root.feed.generalAlerts : []
   // The arrivals feed's own header timestamp, i.e. when the MTA last
   // published it. The MTA's feeds occasionally stall while still answering
   // requests; this is how that (or our own polls failing) becomes visible.
-  property double feedTimestamp: 0
+  readonly property double feedTimestamp: root.feed ? root.feed.feedTimestamp : 0
   // Current elevator/escalator outages at this station complex.
-  property var outages: []
+  readonly property var outages: root.feed ? root.feed.outages : []
   // Feeds of a multi-feed board that failed this poll (the rest still show).
-  property var failedFeeds: []
+  readonly property var failedFeeds: root.feed ? root.feed.failedFeeds : []
   // Ways the MTA's data looked unlike itself this poll (bin/mta_feed.py's
-  // sanity checks). Still shown, but flagged: it may not be the MTA's.
-  property var anomalies: []
-  property string lastError: ""
-  property string lastErrorDetail: ""
-  property bool loading: false
+  // sanity checks). Left out or refused: it may not be the MTA's.
+  readonly property var anomalies: root.feed ? root.feed.anomalies : []
+  readonly property string lastError: root.feed ? root.feed.lastError : ""
+  readonly property string lastErrorDetail: root.feed ? root.feed.lastErrorDetail : ""
+  readonly property bool loading: root.feed ? root.feed.loading : false
   // A helper that hasn't finished in this long is stopped. Each bounds its
   // own downloads (~10 s, ~20 s worst case), so this only catches a hang
   // somewhere else — which would otherwise block every later refresh.
   readonly property int helperTimeoutMs: 45000
-  property bool pollTimedOut: false
-  property double loadingStartedAt: 0
+  readonly property double loadingStartedAt: root.feed ? root.feed.loadingStartedAt : 0
   property int loadingElapsedSeconds: 0
 
   // True only for a "cold" load — switching stations, or the very first
@@ -174,7 +207,7 @@ Panel {
   // part of this station regardless of whether it's currently running.
   // A line with no service today (skip-stop, reroute, suspended) is still
   // part of the system here — it shouldn't just vanish from the badges as
-  // if it never served this stop; see notRunningRoutes below.
+  // if it never served this stop.
   readonly property var availableRoutes: Model.distinctRoutes(arrivals, Stations.makeRouteComparator(root.feedGroup))
   // Union of routes across every stop_id in a (possibly multi-id, for a
   // whole-complex pick) stopId — falls back to availableRoutes for a
@@ -207,6 +240,10 @@ Panel {
     persistSettings({ routeFilter: everything ? "" : all.filter(function(r) { return selected.indexOf(r) !== -1 }).join(",") })
   }
 
+  function showOnlyRoute(route) {
+    persistSettings({ routeFilter: root.allStationRoutes.length > 1 ? route : "" })
+  }
+
   // Slow on/off blink driving the not-currently-running badges below,
   // toggling each between its route letter and a warning glyph. Only runs
   // while the popup is open — no reason to tick a timer against a hidden UI.
@@ -236,6 +273,19 @@ Panel {
   // direction with no tabs.
   readonly property bool bothDirections: root.direction === "both"
   property string selectedDirection: root.direction === "S" ? "S" : "N"
+  property bool directionSettled: false
+
+  function settleDirection() {
+    root.directionSettled = true
+    if (!root.bothDirections) return
+    var counts = { N: 0, S: 0 }
+    var live = Model.liveArrivals(root.arrivals, Date.now() / 1000)
+    for (var i = 0; i < live.length; i++) {
+      if (root.routeSelected(live[i].route) && counts[live[i].dir] !== undefined) counts[live[i].dir]++
+    }
+    var other = root.selectedDirection === "S" ? "N" : "S"
+    if (counts[root.selectedDirection] === 0 && counts[other] > 0) root.selectedDirection = other
+  }
 
   // Arrivals-list time format: relative countdown ("4m") by default, or an
   // absolute clock time ("4:16 PM") when toggled via the stopwatch icon
@@ -255,8 +305,6 @@ Panel {
     onTriggered: {
       root.nowSeconds = Date.now() / 1000
       root.applyCommute()
-      // A ride whose arrival time is well past ends even if polls fail.
-      if (root.ride && root.nowSeconds > root.ride.alightEpoch + 180) root.endRide()
     }
   }
 
@@ -320,9 +368,9 @@ Panel {
       + (plannedAlerts.length > 0 ? " · " + plannedAlerts.length + " planned work" : "")
       + (elevatorOutageCount > 0 ? " · ♿ " + elevatorOutageCount + " elevator" + (elevatorOutageCount > 1 ? "s" : "") + " out" : "")
       + (failedFeeds.length > 0 ? " · couldn't load " + failedFeeds.join(", ") : "")
-      + (anomalies.length > 0 ? " · ⚠ MTA data looked unusual" : "")
+      + (anomalies.length > 0 ? " · ⚠ some MTA data was left out" : "")
       + (leaveAlarm ? " · 🔔 reminder set for the " + leaveAlarm.route : "")
-      + (generalAlerts.length > 0 ? " · " + generalAlerts[0].header : "")
+      + (generalAlerts.length > 0 ? " · " + Model.truncateName(generalAlerts[0].header, 160) : "")
 
   // ---- Legend: a static explainer for the UI language that's accumulated
   // (route bullet colors, the blinking "not running" badge, the alert count
@@ -392,6 +440,20 @@ Panel {
     root.closePicker()
   }
 
+  readonly property var nextNorth: root.contextAbove.length > 0 ? root.contextAbove[root.contextAbove.length - 1] : null
+  readonly property var nextSouth: root.contextBelow.length > 0 ? root.contextBelow[0] : null
+
+  function goToStation(id) {
+    var station = Stations.stationById(id)
+    if (!station) return
+    var kept = root.routeFilterList.filter(function(r) { return station.routes.indexOf(r) !== -1 })
+    persistSettings({
+      stopId: station.id, feedGroup: station.feedGroup, label: station.name,
+      routeFilter: kept.length === station.routes.length ? "" : kept.join(",")
+    })
+    Qt.callLater(function() { root.approachExpanded = true })
+  }
+
   // ---- Favorites / commute presets.
   function favoriteMatches(f) {
     return !!f && f.stopId === root.stopId && String(f.routeFilter || "") === root.routeFilter
@@ -455,73 +517,28 @@ Panel {
   // walkMinutes before it reaches the station (or 2 minutes, with no walk
   // time set). Tracks the train by trip id, so the reminder moves with it
   // if it runs late, and survives closing the popup.
-  property var leaveAlarm: null
-  readonly property int leaveLeadSeconds: root.walkMinutes > 0 ? root.walkMinutes * 60 : 120
+  readonly property var leaveAlarm: root.feed ? root.feed.leaveAlarm : null
 
   function alarmIsFor(train) {
-    return !!train && !!root.leaveAlarm && root.leaveAlarm.tripId === train.tripId && root.leaveAlarm.dir === train.dir
+    return !!root.feed && root.feed.alarmIsFor(train)
   }
 
   function setLeaveAlarm(train) {
-    if (!train || !train.tripId) return
-    root.leaveAlarm = {
+    if (!train || !train.tripId || !root.feed) return
+    root.feed.setLeaveAlarm({
       tripId: train.tripId, route: train.route, dir: train.dir, epoch: train.epoch,
       dest: root.destinationName(train), station: root.stationLabel
-    }
-    root.checkLeaveAlarm()
+    })
   }
 
   function cancelLeaveAlarm() {
-    root.leaveAlarm = null
-  }
-
-  function checkLeaveAlarm() {
-    var alarm = root.leaveAlarm
-    if (!alarm) return
-    var now = Date.now() / 1000
-    if (now > alarm.epoch + 60) { root.leaveAlarm = null; return } // that train's gone
-    if (now < alarm.epoch - root.leaveLeadSeconds) return
-    var mins = Math.max(0, Math.round((alarm.epoch - now) / 60))
-    var title = root.walkMinutes > 0 ? "Time to leave for the " + alarm.route : "The " + alarm.route + " is almost here"
-    var body = "To " + alarm.dest + " · reaches " + alarm.station + " " + (mins === 0 ? "now" : "in " + mins + "m")
-      + " (" + Model.formatClockTime(alarm.epoch) + ")"
-    root.notify(title, body, "critical")
-    root.leaveAlarm = null
-  }
-
-  Timer {
-    interval: 5000
-    running: !!root.leaveAlarm
-    repeat: true
-    onTriggered: root.checkLeaveAlarm()
-  }
-
-  // Desktop notifications go through one notify-send Process, queued so
-  // two at once (a reminder and a new alert) don't clobber each other.
-  // The body is escaped: the shell renders notification bodies as markup
-  // with live links, and alert text comes straight from the MTA's feed.
-  property var notifyQueue: []
-  function notify(title, body, urgency) {
-    root.notifyQueue = root.notifyQueue.concat([["notify-send", "-a", "OMTArchy", "-u", urgency || "normal", title, Model.escapeMarkup(body)]])
-    root.pumpNotify()
-  }
-  function pumpNotify() {
-    if (notifyProc.running || root.notifyQueue.length === 0) return
-    notifyProc.command = root.notifyQueue[0]
-    root.notifyQueue = root.notifyQueue.slice(1)
-    notifyProc.running = true
-  }
-  Process {
-    id: notifyProc
-    onRunningChanged: if (!running) Qt.callLater(root.pumpNotify)
+    if (root.feed) root.feed.cancelLeaveAlarm()
   }
 
   // ---- New-alert notifications. The first poll after switching station
   // (or lines) only records what's already active, so turning the board to
   // a new station never fires a burst of old alerts; after that, any live
   // delay that wasn't there last time is announced once.
-  property var seenAlertHeaders: ({})
-  property string seenAlertsFor: ""
   readonly property bool onCommuteStation: {
     if (!root.commuteAuto) return false
     var period = new Date(root.nowSeconds * 1000).getHours() < root.commuteSwitchHour ? "am" : "pm"
@@ -531,70 +548,29 @@ Panel {
     return false
   }
 
-  function notifyNewAlerts() {
-    var key = root.stopId + "|" + root.routeFilter
-    var fresh = root.seenAlertsFor !== key
-    var seen = fresh ? {} : root.seenAlertHeaders
-    var wanted = root.alertNotify === "always" || (root.alertNotify === "commute" && root.onCommuteStation)
-    for (var i = 0; i < root.liveAlerts.length; i++) {
-      var a = root.liveAlerts[i]
-      if (!fresh && wanted && a.kind === "delay" && !seen[a.header]) {
-        root.notify("Service alert" + (a.routes && a.routes.length ? ": " + a.routes.join(" ") : "") + " at " + root.stationLabel, a.header, "normal")
-      }
-      seen[a.header] = true
-    }
-    root.seenAlertHeaders = seen
-    root.seenAlertsFor = key
-  }
-
   // ---- "I'm on this train": pick a train, then the stop you're getting off
   // at, and the bar counts down to it; a notification fires when it's the
-  // next stop. Polled through the regular arrivals fetch (see rideToken),
-  // which keeps following the train after it leaves the tracked station.
-  property var ride: null
+  // next stop. Polled through the regular arrivals fetch, which keeps
+  // following the train after it leaves the tracked station.
+  readonly property var ride: root.feed ? root.feed.ride : null
   property bool ridePickMode: false
-  readonly property string rideToken: ride ? ride.feed + "|" + ride.tripId + "|" + ride.alightStopId : ""
+  onRideChanged: if (!root.ride) root.ridePickMode = false
 
   function startRide(train, stopId, epoch) {
-    if (!train || !train.tripId || !train.feed) return
+    if (!train || !train.tripId || !train.feed || !root.feed) return
     var station = Stations.stationById(stopId)
-    root.ride = {
+    root.feed.startRide({
       tripId: train.tripId, feed: train.feed, route: train.route, dir: train.dir,
       alightStopId: stopId, alightName: station ? station.name : stopId, alightEpoch: epoch,
       stopsLeft: -1, notifiedNext: false, misses: 0
-    }
+    })
     root.ridePickMode = false
     root.closeTrainDetail()
-    root.refresh()
   }
 
   function endRide() {
-    root.ride = null
+    if (root.feed) root.feed.endRide()
     root.ridePickMode = false
-  }
-
-  // One poll's ride report (null = no ride, or its feed couldn't be
-  // checked this time — not evidence the train is gone).
-  function updateRide(info) {
-    if (!root.ride || !info) return
-    var next = {}
-    for (var k in root.ride) next[k] = root.ride[k]
-    if (info.found) {
-      next.alightEpoch = info.alightEpoch
-      next.stopsLeft = info.stopsLeft
-      next.misses = 0
-      if (info.stopsLeft === 0 && !next.notifiedNext) {
-        root.notify("Your stop is next: " + next.alightName,
-          "The " + next.route + " gets there at " + Model.formatClockTime(next.alightEpoch), "critical")
-        next.notifiedNext = true
-      }
-    } else {
-      next.misses = (next.misses || 0) + 1
-      // The trip leaves the feed once the train passes your stop (or the
-      // trip ends): two misses in a row, or a miss near arrival time, ends it.
-      if (next.misses >= 2 || root.nowSeconds > next.alightEpoch - 60) { root.endRide(); return }
-    }
-    root.ride = next
   }
 
   // ---- Lines view: system-wide status of every line (bin/nyc-subway-lines),
@@ -621,7 +597,7 @@ Panel {
     if (linesProc.running) return
     root.linesLoading = true
     root.linesTimedOut = false
-    linesProc.command = ["python3", root.linesHelper]
+    linesProc.command = Model.helperCommand(root.linesHelper)
     linesProc.running = true
   }
 
@@ -653,7 +629,7 @@ Panel {
   }
 
   Timer {
-    interval: root.pollIntervalMs
+    interval: root.linesError !== "" ? Math.max(root.pollIntervalMs, 120000) : root.pollIntervalMs
     running: root.linesOpen && root.opened
     repeat: true
     onTriggered: root.runLinesQuery()
@@ -672,28 +648,25 @@ Panel {
     return count + ", " + (train.posStatus === "at" ? "at " : "approaching ") + (station ? station.name : train.posStopId)
   }
 
-  // After each poll: the open train-detail view and the leave reminder
-  // follow their train's fresh times (matched by trip id) instead of
-  // staying a snapshot from when they were opened.
+  // After each poll: the open train-detail view follows its train's fresh
+  // times (matched by trip id) instead of staying a snapshot from when it
+  // was opened.
   function syncLiveTrains() {
-    var i
     if (root.selectedTrain && root.selectedTrain.tripId) {
-      for (i = 0; i < root.arrivals.length; i++) {
+      for (var i = 0; i < root.arrivals.length; i++) {
         var a = root.arrivals[i]
         if (a.tripId === root.selectedTrain.tripId && a.dir === root.selectedTrain.dir) { root.selectedTrain = a; break }
       }
     }
-    if (root.leaveAlarm) {
-      for (i = 0; i < root.arrivals.length; i++) {
-        var b = root.arrivals[i]
-        if (root.alarmIsFor(b)) {
-          var next = {}
-          for (var k in root.leaveAlarm) next[k] = root.leaveAlarm[k]
-          next.epoch = b.epoch
-          root.leaveAlarm = next
-          break
-        }
-      }
+  }
+
+  Connections {
+    target: root.feed
+    ignoreUnknownSignals: true
+    function onResultSerialChanged() {
+      root.nowSeconds = Date.now() / 1000
+      root.syncLiveTrains()
+      if (!root.directionSettled) root.settleDirection()
     }
   }
 
@@ -749,6 +722,8 @@ Panel {
 
   function openTrainDetail(train) {
     if (!train) return
+    root.followRows = []
+    root.followRowsTrip = ""
     root.selectedTrain = train
     root.trainDetailOpen = true
   }
@@ -766,20 +741,159 @@ Panel {
     ? ((root.selectedTrain.dir === "S" ? root.selectedStation.prevNorth : root.selectedStation.prevSouth) || [])
     : []
 
-  // Combined display list for the trip detail Repeater: static "before"
-  // context rows (no live time — they're not part of this trip's actual
-  // stop_time_updates), then this train's full fetched stop list starting
-  // with the boarding station at index 0.
+  readonly property string followToken: root.trainDetailOpen && root.selectedTrain && root.selectedTrain.tripId && root.selectedTrain.feed
+    ? root.selectedTrain.feed + "|" + root.selectedTrain.tripId : ""
+  onFollowTokenChanged: if (root.feed) root.feed.follow(root.followToken)
+
+  readonly property var followed: root.feed && root.feed.followed && root.selectedTrain && root.feed.followed.tripId === root.selectedTrain.tripId
+    ? root.feed.followed : null
+  property var followRows: []
+  property string followRowsTrip: ""
+  onFollowedChanged: root.mergeFollowed()
+
+  function mergeFollowed() {
+    var f = root.followed
+    if (!f || !f.found || !f.stops || f.stops.length === 0) return
+    var previous = root.followRowsTrip === f.tripId ? root.followRows : []
+    var at = -1
+    for (var i = 0; i < previous.length; i++) if (previous[i].stopId === f.stops[0].stopId) { at = i; break }
+    var passed = previous.slice(0, Math.max(0, at)).map(function(r) { return { stopId: r.stopId, epoch: r.epoch, passed: true } })
+    root.followRows = passed.concat(f.stops.map(function(s) { return { stopId: s.stopId, epoch: s.epoch, passed: false } }))
+    root.followRowsTrip = f.tripId
+  }
+
+  readonly property string trainBoardStopId: root.selectedTrain && root.selectedTrain.stops && root.selectedTrain.stops.length > 0
+    ? root.selectedTrain.stops[0].stopId : ""
+  readonly property bool following: !!root.selectedTrain && root.followRows.length > 0 && root.followRowsTrip === root.selectedTrain.tripId
+    && root.followRows.some(function(r) { return r.stopId === root.trainBoardStopId })
+
+  // Combined display list for the trip detail Repeater: once the train is
+  // followed, its live path (stations passed since the view opened, then
+  // where it is now onward); before that, static "before" context rows (no
+  // live time — they're not part of this trip's actual stop_time_updates),
+  // then this train's full fetched stop list starting with the boarding
+  // station.
   readonly property var tripStopsDisplay: {
     if (!root.selectedTrain) return []
     var before = root.tripApproachNeighbors.map(function(n) {
       return { stopId: n.id, name: n.name, epoch: 0, isContext: true, isBoard: false }
     })
+    if (root.following) {
+      var reached = false
+      var path = root.followRows.map(function(r) {
+        var board = r.stopId === root.trainBoardStopId
+        if (board) reached = true
+        return { stopId: r.stopId, epoch: r.epoch, isContext: false, isBoard: board, isBefore: !reached, passed: r.passed }
+      })
+      return path[0].isBoard ? before.concat(path) : path
+    }
     var forward = root.selectedTrain.stops || []
     var forwardRows = forward.map(function(s, i) {
       return { stopId: s.stopId, epoch: s.epoch, isContext: false, isBoard: i === 0 }
     })
     return before.concat(forwardRows)
+  }
+
+  readonly property int trainBoardRow: {
+    var rows = root.tripStopsDisplay
+    for (var i = 0; i < rows.length; i++) if (rows[i].isBoard) return i
+    return -1
+  }
+
+  readonly property int trainPathStart: {
+    var rows = root.tripStopsDisplay
+    for (var i = 0; i < rows.length; i++) if (!rows[i].isContext) return i
+    return 0
+  }
+
+  readonly property bool legacyApproaching: {
+    var t = root.selectedTrain
+    return !!t && t.assigned !== false && !!t.posStatus && !(Number(t.stopsAway) === 0 && t.posStatus === "at")
+  }
+
+  function segmentSeconds(stops) {
+    var gaps = []
+    for (var i = 1; i < Math.min(stops.length, 7); i++) gaps.push(stops[i].epoch - stops[i - 1].epoch)
+    gaps.sort(function(a, b) { return a - b })
+    return gaps.length > 0 ? Math.max(30, gaps[Math.floor(gaps.length / 2)]) : 120
+  }
+
+  property double railNow: Date.now() / 1000
+  Timer {
+    interval: 2000
+    running: root.opened && root.trainDetailOpen
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.railNow = Date.now() / 1000
+  }
+
+  readonly property int trainReportedRow: {
+    var f = root.followed
+    if (!root.following || !f || !f.found || !f.posStopId) return -1
+    var rows = root.tripStopsDisplay
+    var j = -1
+    for (var k = root.trainPathStart; k < rows.length; k++) if (rows[k].stopId === f.posStopId) j = k
+    return j
+  }
+
+  readonly property real rawRailPosition: {
+    var t = root.selectedTrain
+    if (root.following) {
+      var f = root.followed
+      if (!f || !f.found || t.assigned === false) return -1
+      var epochs = root.tripStopsDisplay.map(function(r) { return r.epoch })
+      return Model.railPosition(epochs, root.trainPathStart, root.railNow, root.segmentSeconds(f.stops), root.trainReportedRow, f.posStatus)
+    }
+    if (!root.legacyApproaching) return -1
+    var board = root.tripApproachNeighbors.length
+    var away = Number(t.stopsAway)
+    var row = board - away
+    if (away > 0 && (row < 0 || root.tripApproachNeighbors[row].id !== t.posStopId)) return -1
+    if (t.posStatus === "at") return row
+    var legacySegment = root.segmentSeconds(t.stops || [])
+    var toNext = Number(t.epoch) - root.railNow - away * legacySegment
+    var position = row - 1 + Math.min(1, Math.max(0, 1 - toNext / legacySegment))
+    return position >= 0 ? position : -1
+  }
+
+  readonly property string railFloorKey: (root.selectedTrain ? root.selectedTrain.tripId : "") + "|" + root.following
+    + "|" + (root.following && root.followRows.length > 0 ? root.followRows[0].stopId : "")
+  property real railFloor: -1
+  property string railFloorFor: ""
+  onRawRailPositionChanged: {
+    if (root.railFloorFor !== root.railFloorKey) {
+      root.railFloorFor = root.railFloorKey
+      root.railFloor = -1
+    }
+    if (root.rawRailPosition > root.railFloor) root.railFloor = root.rawRailPosition
+  }
+  readonly property real trainRailPosition: root.rawRailPosition < -0.5 || root.railFloorFor !== root.railFloorKey
+    ? root.rawRailPosition : Math.max(root.rawRailPosition, root.railFloor)
+
+  readonly property bool trainOnRail: root.trainRailPosition > -0.5
+
+  readonly property bool trainApproaching: root.following
+    ? root.trainOnRail && root.trainRailPosition < root.trainBoardRow
+    : root.legacyApproaching
+
+  readonly property real trainRailTip: !root.trainOnRail ? -1
+    : (root.trainApproaching ? Math.min(root.trainRailPosition, root.trainBoardRow - Style.space(15) / Style.space(40)) : root.trainRailPosition)
+
+  readonly property real trainFillStart: root.following
+    ? Math.min(Math.floor(root.trainRailPosition), root.trainPathStart) : Math.floor(root.trainRailPosition)
+
+  readonly property string trainDetailPhrase: {
+    var t = root.selectedTrain
+    if (!root.following) return root.positionPhrase(t)
+    var f = root.followed
+    if (!f || !f.found) return "No longer in the live feed"
+    if (!f.posStatus || !f.posStopId) return ""
+    var j = root.trainReportedRow
+    if (j < 0) return ""
+    if (j <= root.trainBoardRow) return root.positionPhrase({ assigned: true, stopsAway: root.trainBoardRow - j, posStatus: f.posStatus, posStopId: f.posStopId })
+    var here = Stations.stationById(f.posStopId)
+    var board = Stations.stationById(root.trainBoardStopId)
+    return "Left " + (board ? board.name : root.trainBoardStopId) + " · " + (f.posStatus === "at" ? "at " : "approaching ") + (here ? here.name : f.posStopId)
   }
 
   // Swaps to the opposite direction without leaving the trip detail panel:
@@ -838,12 +952,12 @@ Panel {
     root.tripPendingKey = root.tripRequestKey
     root.tripLoading = true
     root.tripTimedOut = false
-    tripProc.command = Model.tripPollCommand(
-      root.tripHelper,
+    tripProc.payload = Model.tripInput(
       root.joinPairs(root.tripOrigin.pills),
       root.joinPairs(root.tripDestination.pills),
       transferPairs
     )
+    tripProc.command = Model.helperCommand(root.tripHelper)
     tripProc.running = true
   }
 
@@ -869,8 +983,12 @@ Panel {
     else root.openFromHotkey()
   }
 
-  // Esc steps back one view (picker -> trip planner -> arrivals, or train
-  // detail -> arrivals) instead of closing the whole popup from anywhere.
+  readonly property bool backCloses: !root.pickerOpen && !root.ridePickMode && !root.trainDetailOpen
+    && !root.linesOpen && !root.tripPlannerOpen && !root.showLegend
+
+  // Esc and each view's back button step back one view (picker -> trip
+  // planner -> arrivals, or train detail -> arrivals) instead of closing the
+  // whole popup from anywhere.
   function goBack() {
     if (root.pickerOpen) root.closePicker()
     else if (root.ridePickMode) root.ridePickMode = false
@@ -885,63 +1003,39 @@ Panel {
   // arrives after the user has already moved on can be told apart from one
   // that's still current.
   readonly property string requestKey: root.feedGroup + "|" + root.stopId + "|" + root.direction + "|" + root.routeFilter
-  property string pendingRequestKey: ""
 
   function refresh() {
-    if (root.stopId === "") return
-    if (pollProc.running) {
-      // A fetch is already in flight for whatever was configured when it
-      // started — by the time it finishes that may no longer be current
-      // (the user switched stations again in the meantime). Stopping and
-      // immediately restarting the same Process back-to-back is flaky (it
-      // can come back with no output at all), so instead: let it finish
-      // naturally, and onStreamFinished below re-checks requestKey and
-      // calls refresh() again right away if it's gone stale. Worst case
-      // that's one extra fetch's worth of delay (under a second, typically)
-      // instead of silently waiting for the next pollIntervalMs tick.
-      return
-    }
-    root.pendingRequestKey = root.requestKey
-    root.loading = true
-    root.pollTimedOut = false
-    root.loadingStartedAt = Date.now()
-    root.loadingElapsedSeconds = 0
-    pollProc.command = Model.pollCommand(root.helper, root.feedGroup, root.stopId, root.direction, root.routeFilter, root.alertRoutes, root.complexIds, root.rideToken)
-    pollProc.running = true
+    if (root.feed) root.feed.requestRefresh()
   }
+
+  onLoadingChanged: if (root.loading) root.loadingElapsedSeconds = 0
 
   // A fresh station means stale data too: without this, the previous
   // stop's arrivals stay on screen — looking current — for however long the
   // new fetch takes, which is actively misleading rather than just slow.
   function resetForNewStation() {
-    root.arrivals = []
-    root.alerts = []
-    root.generalAlerts = []
-    root.feedTimestamp = 0
-    root.outages = []
-    root.failedFeeds = []
-    root.anomalies = []
-    root.lastError = ""
-    root.lastErrorDetail = ""
     root.alertsExpanded = false
     root.plannedExpanded = false
     root.outagesExpanded = false
     root.extraArrivals = 0
     root.trainDetailOpen = false
     root.approachExpanded = false
+    root.directionSettled = false
   }
 
-  onStopIdChanged: { resetForNewStation(); refresh() }
-  onFeedGroupChanged: { resetForNewStation(); refresh() }
-  onDirectionChanged: { selectedDirection = root.direction === "S" ? "S" : "N"; refresh() }
-  onRouteFilterChanged: refresh()
+  onStopIdChanged: resetForNewStation()
+  onFeedGroupChanged: resetForNewStation()
+  onDirectionChanged: selectedDirection = root.direction === "S" ? "S" : "N"
   // Reopening from the bar always lands on the arrivals board, not on
   // whatever sub-view (a train's detail, the picker) was left open; the
   // trip planner's From/To picks are kept.
   onOpenedChanged: {
     if (opened) {
+      root.openAnchorX = root.anchorItemX
+      root.openAnchorWidth = root.anchorItem ? root.anchorItem.width : 0
       refresh()
     } else {
+      root.openAnchorX = -1
       root.trainDetailOpen = false
       root.pickerOpen = false
       root.tripPlannerOpen = false
@@ -951,65 +1045,7 @@ Panel {
       root.extraArrivals = 0
     }
   }
-  Component.onCompleted: refresh()
-
-  Process {
-    id: pollProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        // This result was for whatever was configured when the fetch
-        // started; the user may have switched stations again while it was
-        // in flight. If so it's stale — don't let it overwrite (or get
-        // mistaken for) data about the station actually on screen now.
-        // refresh() immediately re-fetches for whatever is current instead
-        // of leaving the board stuck until the next pollIntervalMs tick.
-        if (root.pendingRequestKey !== root.requestKey) {
-          Qt.callLater(root.refresh)
-          return
-        }
-
-        root.loading = false
-        if (root.pollTimedOut) {
-          root.lastError = "helper-timeout"
-          root.lastErrorDetail = ""
-          return
-        }
-        var parsed = Model.parseArrivals(text)
-        if (parsed.ok) {
-          root.anomalies = parsed.anomalies
-          root.arrivals = parsed.arrivals
-          root.alerts = parsed.alerts
-          root.generalAlerts = parsed.generalAlerts
-          root.feedTimestamp = parsed.feedTimestamp
-          root.outages = parsed.outages
-          root.failedFeeds = parsed.failedFeeds
-          root.nowSeconds = Date.now() / 1000
-          root.lastError = ""
-          root.syncLiveTrains()
-          root.updateRide(parsed.ride)
-          root.notifyNewAlerts()
-        } else {
-          root.lastError = parsed.error
-          root.lastErrorDetail = parsed.detail || ""
-        }
-      }
-    }
-  }
-
-  Timer {
-    interval: root.pollIntervalMs
-    running: true
-    repeat: true
-    triggeredOnStart: true
-    onTriggered: root.refresh()
-  }
-
-  Timer {
-    interval: root.helperTimeoutMs
-    running: pollProc.running
-    onTriggered: { root.pollTimedOut = true; pollProc.running = false }
-  }
+  Component.onCompleted: configureFeed()
 
   property bool tripTimedOut: false
   Timer {
@@ -1020,10 +1056,13 @@ Panel {
 
   Process {
     id: tripProc
+    property string payload: ""
+    stdinEnabled: true
+    onStarted: write(payload)
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        // Same staleness guard as pollProc above: a query answers whatever
+        // Same staleness guard as the arrivals poll: a query answers whatever
         // From/To was set when it started, which may not be current by the
         // time it finishes.
         if (root.tripPendingKey !== root.tripRequestKey) {
@@ -1078,9 +1117,32 @@ Panel {
   // KeyboardPanel is its own layer-shell surface with an explicit
   // Exclusive-then-OnDemand focus grab — the same reason weather's location
   // search uses it instead of PopupCard.
+  property real openAnchorX: -1
+  property real openAnchorWidth: 0
+
+  TransformWatcher {
+    id: anchorMove
+    a: steadyAnchor.QsWindow.window ? steadyAnchor.QsWindow.window.contentItem : null
+    b: root.anchorItem
+  }
+
+  readonly property real anchorItemX: {
+    anchorMove.transform
+    var win = steadyAnchor.QsWindow.window
+    return win && root.anchorItem ? root.anchorItem.mapToItem(win.contentItem, 0, 0).x : 0
+  }
+
+  Item {
+    id: steadyAnchor
+    parent: root.anchorItem
+    height: parent ? parent.height : 0
+    width: root.openAnchorX >= 0 ? root.openAnchorWidth : (parent ? parent.width : 0)
+    x: root.openAnchorX >= 0 ? root.openAnchorX - root.anchorItemX : 0
+  }
+
   KeyboardPanel {
     id: popup
-    anchorItem: root.anchorItem
+    anchorItem: steadyAnchor
     bar: root.bar
     owner: root.barIdentity
     open: root.opened
@@ -1177,60 +1239,79 @@ Panel {
                 width: parent.width
                 spacing: Style.space(8)
 
-                Text {
-                  textFormat: Text.PlainText
-                  text: root.stopId === "" ? "No stop configured"
-                    : (root.stopSummary + (root.feedStale ? " · data " + root.feedAgeMinutes + "m old" : ""))
-                  color: root.feedStale ? "#E8A33D" : root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                Row {
+                  id: summaryGroup
+                  spacing: subtitleRow.spacing
+                  Text {
+                    textFormat: Text.PlainText
+                    text: root.stopId === "" ? "No stop configured"
+                      : (root.stopSummary + (root.feedStale ? " · data " + root.feedAgeMinutes + "m old" : ""))
+                    color: root.feedStale ? "#E8A33D" : root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "|"
+                    opacity: changeGroup.y === summaryGroup.y ? 1 : 0
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
                 }
-                Text {
-                  textFormat: Text.PlainText
-                  text: "|"
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                Row {
+                  id: changeGroup
+                  spacing: subtitleRow.spacing
+                  TextLink {
+                    text: "Change"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    onActivated: root.openPicker()
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "|"
+                    opacity: tripGroup.y === changeGroup.y ? 1 : 0
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
                 }
-                TextLink {
-                  text: "Change"
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  onActivated: root.openPicker()
+                Row {
+                  id: tripGroup
+                  spacing: subtitleRow.spacing
+                  TextLink {
+                    text: "Plan a Trip"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    onActivated: root.openTripPlanner()
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "|"
+                    opacity: linesGroup.y === tripGroup.y ? 1 : 0
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
                 }
-                Text {
-                  textFormat: Text.PlainText
-                  text: "|"
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-                TextLink {
-                  text: "Plan a Trip"
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  onActivated: root.openTripPlanner()
-                }
-                Text {
-                  textFormat: Text.PlainText
-                  text: "|"
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                }
-                TextLink {
-                  text: "Lines"
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  onActivated: root.openLines()
-                }
-
-                Text {
-                  textFormat: Text.PlainText
-                  text: "|"
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
+                Row {
+                  id: linesGroup
+                  spacing: subtitleRow.spacing
+                  TextLink {
+                    text: "Lines"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    onActivated: root.openLines()
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "|"
+                    opacity: helpLink.y === linesGroup.y ? 1 : 0
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
                 }
                 // Was a bordered circular "?" badge pinned to the header's
                 // top-right corner — moved down here so the top row has
@@ -1238,6 +1319,7 @@ Panel {
                 // next to the stopwatch icon, instead of the two competing
                 // for space.
                 TextLink {
+                  id: helpLink
                   text: "Help"
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
@@ -1259,7 +1341,7 @@ Panel {
               id: clockToggleIcon
               visible: root.stopId !== "" && root.visibleArrivals.length > 0
               text: "⏱"
-              color: root.showClockTime ? Color.accent : root.dim
+              color: root.showClockTime ? Commons.Color.accent : root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               anchors.right: parent.right
@@ -1273,7 +1355,7 @@ Panel {
               id: favoriteIcon
               visible: root.stopId !== ""
               text: root.isFavorite ? "★" : "☆"
-              color: root.isFavorite ? Color.accent : root.dim
+              color: root.isFavorite ? Commons.Color.accent : root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               anchors.right: clockToggleIcon.left
@@ -1311,9 +1393,9 @@ Panel {
             width: parent.width
             height: rideColumn.implicitHeight + Style.space(16)
             radius: Style.cornerRadius
-            color: Style.selectedFillFor(root.foreground, Color.accent)
+            color: Style.selectedFillFor(root.foreground, Commons.Color.accent)
             border.width: 1
-            border.color: Color.accent
+            border.color: Commons.Color.accent
 
             Column {
               id: rideColumn
@@ -1353,7 +1435,7 @@ Panel {
                 textFormat: Text.PlainText
                 text: root.ride
                   ? "Arrives " + Model.formatClockTime(root.ride.alightEpoch)
-                    + " · in " + Model.formatMinutes(Math.max(0, (root.ride.alightEpoch - root.nowSeconds) / 60))
+                    + " · " + Model.inMinutesPhrase(Math.max(0, (root.ride.alightEpoch - root.nowSeconds) / 60))
                     + (root.ride.stopsLeft === 0 ? " · next stop" : root.ride.stopsLeft > 0 ? " · " + (root.ride.stopsLeft + 1) + " stops" : "")
                   : ""
                 color: root.dim
@@ -1384,10 +1466,10 @@ Panel {
                 radius: height / 2
                 antialiasing: true
                 color: current
-                  ? Style.selectedFillFor(root.foreground, Color.accent)
-                  : (hovered ? Style.hoverFillFor(root.foreground, Color.accent) : Style.normalFillFor(root.foreground, Color.accent))
+                  ? Style.selectedFillFor(root.foreground, Commons.Color.accent)
+                  : (hovered ? Style.hoverFillFor(root.foreground, Commons.Color.accent) : Style.normalFillFor(root.foreground, Commons.Color.accent))
                 border.width: current ? 1 : 0
-                border.color: Color.accent
+                border.color: Commons.Color.accent
 
                 Row {
                   id: favRow
@@ -1407,7 +1489,7 @@ Panel {
                     textFormat: Text.PlainText
                     visible: favChip.role !== ""
                     text: favChip.role.toUpperCase()
-                    color: Color.accent
+                    color: Commons.Color.accent
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     font.bold: true
@@ -1467,12 +1549,13 @@ Panel {
                   { sample: "⚠", color: "#5A6268", note: "A dim, blinking badge means that line isn't running right now — it's still part of the station, just not in service." },
                   { sample: "3", color: "#E8A33D", note: "The number next to \"Service Alerts\" is how many are active for this station's lines. Tap it to show or hide them." },
                   { sample: "◆", color: "#00933C", note: "A ◆ after a destination marks a peak-direction express (the diamond 6, 7, or F), which skips local stops." },
-                  { sample: "−", color: "#00933C", note: "Tap a line's circle under the alerts to hide or show its trains; hover shows − or +. \"Select all\" brings every line back." },
+                  { sample: "−", color: "#00933C", note: "Tap a line's circle under the alerts to hide or show its trains; hover shows − or +. Right-click a circle to show only that line. \"Select all\" brings every line back." },
                   { sample: "🚇", color: "#5A6268", note: "On a train? Tap it, then \"I'm on this train\" and your stop: the bar counts down to it and you get a notification when it's next." },
                   { sample: "~", color: "#5A6268", note: "A ~ before a time means no train has been assigned to that trip yet — it's the schedule's guess, and the trip may not run." },
                   { sample: "★", color: "#5A6268", note: "☆ at the top right saves this station as a favorite. Tap a favorite to switch to it; right-click it to mark it AM or PM, then turn on commute mode in the widget settings to switch automatically." },
                   { sample: "🔔", color: "#5A6268", note: "Tap a train, then \"Remind me\", for a notification when it's time to leave (set your walk time in the widget settings)." },
-                  { sample: "⇄", color: "#5A6268", note: "\"Uptown\"/\"Downtown\" (or a station's real signage, like \"Queens\"/\"Manhattan\") picks which direction's trains are listed." }
+                  { sample: "⇄", color: "#5A6268", note: "\"Uptown\"/\"Downtown\" (or a station's real signage, like \"Queens\"/\"Manhattan\") picks which direction's trains are listed." },
+                  { sample: "▲", color: "#00933C", note: "Tap the station name's ⌄ to see the stops on either side. Tap one to switch to it, or use ▲/▼ to step to the next stop uptown or downtown." }
                 ]
                 delegate: Row {
                   required property var modelData
@@ -1514,9 +1597,9 @@ Panel {
           // no body content at all, since the header above already carries
           // the station name and its own expand/collapse trigger; repeating
           // the name down here with nothing else would just be noise.
-          // Expanded, this whole region (all 5 rows, not just one of them)
-          // is one big tap target to collapse back — no hunting for a
-          // specific row. A spanning arrow on the left points up the
+          // Expanded, tapping a neighboring stop (or ▲/▼ on the arrow)
+          // switches to it, and tapping anywhere else in the region
+          // collapses it back. A spanning arrow on the left points up the
           // uptown direction, since the list's order is fixed regardless
           // of which direction tab is selected (north above, south below).
           Item {
@@ -1542,18 +1625,48 @@ Panel {
                 id: contextArrowHead
                 textFormat: Text.PlainText
                 text: "▲"
-                color: root.dim
+                color: !root.nextNorth ? root.dim : (upArea.containsMouse ? root.foreground : Commons.Color.accent)
                 font.pixelSize: Style.font.caption
                 anchors.top: parent.top
                 anchors.horizontalCenter: parent.horizontalCenter
+
+                MouseArea {
+                  id: upArea
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(6)
+                  enabled: !!root.nextNorth
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.goToStation(root.nextNorth.id)
+                }
               }
 
               Rectangle {
                 width: Style.space(2)
                 color: root.dim
                 anchors.top: contextArrowHead.bottom
+                anchors.bottom: contextArrowTail.top
+                anchors.horizontalCenter: parent.horizontalCenter
+              }
+
+              Text {
+                id: contextArrowTail
+                textFormat: Text.PlainText
+                text: "▼"
+                color: !root.nextSouth ? root.dim : (downArea.containsMouse ? root.foreground : Commons.Color.accent)
+                font.pixelSize: Style.font.caption
                 anchors.bottom: parent.bottom
                 anchors.horizontalCenter: parent.horizontalCenter
+
+                MouseArea {
+                  id: downArea
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(6)
+                  enabled: !!root.nextSouth
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.goToStation(root.nextSouth.id)
+                }
               }
             }
 
@@ -1572,7 +1685,9 @@ Panel {
                   label: modelData.name
                   dotColor: root.dim
                   textColor: root.dim
+                  hoverColor: root.foreground
                   fontFamily: root.fontFamily
+                  onActivated: root.goToStation(modelData.id)
                 }
               }
 
@@ -1589,7 +1704,7 @@ Panel {
                     width: Style.space(10)
                     height: Style.space(10)
                     radius: width / 2
-                    color: Color.accent
+                    color: Commons.Color.accent
                     anchors.verticalCenter: parent.verticalCenter
                   }
 
@@ -1612,7 +1727,9 @@ Panel {
                   label: modelData.name
                   dotColor: root.dim
                   textColor: root.dim
+                  hoverColor: root.foreground
                   fontFamily: root.fontFamily
+                  onActivated: root.goToStation(modelData.id)
                 }
               }
             }
@@ -1670,7 +1787,7 @@ Panel {
                   textFormat: Text.PlainText
                   visible: root.alertsNeedCollapse
                   text: root.alertsExpanded ? "▲ Hide" : "▼ Show"
-                  color: Color.accent
+                  color: Commons.Color.accent
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   anchors.verticalCenter: parent.verticalCenter
@@ -1794,7 +1911,7 @@ Panel {
                 Text {
                   textFormat: Text.PlainText
                   text: root.plannedExpanded ? "▲ Hide" : "▼ Show"
-                  color: Color.accent
+                  color: Commons.Color.accent
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   anchors.verticalCenter: parent.verticalCenter
@@ -1893,7 +2010,7 @@ Panel {
                 Text {
                   textFormat: Text.PlainText
                   text: root.outagesExpanded ? "▲ Hide" : "▼ Show"
-                  color: Color.accent
+                  color: Commons.Color.accent
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   anchors.verticalCenter: parent.verticalCenter
@@ -2036,7 +2153,7 @@ Panel {
                 textFormat: Text.PlainText
                 width: anomalyColumn.width
                 wrapMode: Text.WordWrap
-                text: "⚠ MTA data looked unusual — double-check before relying on it"
+                text: "⚠ Some MTA data failed a safety check and was left out"
                 color: "#E8A33D"
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -2119,8 +2236,9 @@ Panel {
             Repeater {
               model: root.allStationRoutes
               // Click toggles the line in or out of the board (see
-              // toggleRoute); hovering shows what a click will do — "−" on a
-              // selected line, "+" on a deselected (outline) one.
+              // toggleRoute), right-click shows only that line; hovering shows
+              // what a click will do — "−" on a selected line, "+" on a
+              // deselected (outline) one.
               delegate: RoutePill {
                 id: routeBadge
                 required property string modelData
@@ -2144,8 +2262,12 @@ Panel {
                   id: badgeArea
                   anchors.fill: parent
                   hoverEnabled: true
+                  acceptedButtons: Qt.LeftButton | Qt.RightButton
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: root.toggleRoute(routeBadge.modelData)
+                  onClicked: function(mouse) {
+                    if (mouse.button === Qt.RightButton) root.showOnlyRoute(routeBadge.modelData)
+                    else root.toggleRoute(routeBadge.modelData)
+                  }
                 }
               }
             }
@@ -2193,10 +2315,10 @@ Panel {
                 radius: Style.cornerRadius
                 antialiasing: true
                 color: selected
-                  ? Style.selectedFillFor(root.foreground, Color.accent)
-                  : (hovered ? Style.hoverFillFor(root.foreground, Color.accent) : Style.normalFillFor(root.foreground, Color.accent))
+                  ? Style.selectedFillFor(root.foreground, Commons.Color.accent)
+                  : (hovered ? Style.hoverFillFor(root.foreground, Commons.Color.accent) : Style.normalFillFor(root.foreground, Commons.Color.accent))
                 border.width: selected ? 1 : (hovered ? 1 : 0)
-                border.color: Color.accent
+                border.color: Commons.Color.accent
 
                 Behavior on color { ColorAnimation { duration: 100 } }
 
@@ -2240,7 +2362,7 @@ Panel {
 
                 Rectangle {
                   anchors.fill: parent
-                  color: arrivalRow.hovered ? Style.hoverFillFor(root.foreground, Color.accent) : "transparent"
+                  color: arrivalRow.hovered ? Style.hoverFillFor(root.foreground, Commons.Color.accent) : "transparent"
                 }
 
                 Row {
@@ -2447,7 +2569,7 @@ Panel {
                 width: parent.width
                 wrapMode: Text.WordWrap
                 text: root.selectedTrain
-                  ? [Model.directionTabLabel(root.selectedTrain.dir), root.positionPhrase(root.selectedTrain), Model.delayPhrase(root.selectedTrain)]
+                  ? [Model.directionTabLabel(root.selectedTrain.dir), root.trainDetailPhrase, Model.delayPhrase(root.selectedTrain)]
                     .filter(function(t) { return t !== "" }).join(" · ")
                   : ""
                 color: root.dim
@@ -2474,13 +2596,13 @@ Panel {
 
             IconTapText {
               id: trainDetailClose
-              text: "✕"
+              text: root.backCloses ? "✕" : "⬅"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               anchors.right: parent.right
               anchors.top: parent.top
-              onActivated: root.closeTrainDetail()
+              onActivated: root.goBack()
             }
           }
 
@@ -2528,7 +2650,7 @@ Panel {
             width: parent.width
             wrapMode: Text.WordWrap
             text: "Tap the stop you're getting off at."
-            color: Color.accent
+            color: Commons.Color.accent
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
@@ -2558,40 +2680,113 @@ Panel {
                 id: stopRow
                 required property var modelData
                 required property int index
-                readonly property bool pickable: root.ridePickMode && !modelData.isContext && !modelData.isBoard
+                readonly property bool pickable: root.ridePickMode && !modelData.isContext && !modelData.isBoard && !modelData.isBefore && !modelData.passed
+                readonly property bool hoppable: !root.ridePickMode && !modelData.isBoard && !!Stations.stationById(modelData.stopId)
+                readonly property bool hovered: (pickable || hoppable) && stopPickArea.containsMouse
+                readonly property bool last: index === root.tripStopsDisplay.length - 1
+                readonly property bool dimmed: !!(modelData.isContext || modelData.isBefore || modelData.passed)
+                readonly property real fillTop: Math.max(index - 0.5, root.trainFillStart)
+                readonly property real fillBottom: Math.min(index + 0.5, root.trainRailTip)
+                readonly property bool holdsTrain: root.trainOnRail && Math.round(root.trainRailTip) === index
                 width: trainDetailView.width
                 height: Style.space(40)
+                z: holdsTrain ? 1 : 0
 
                 // Ride pick mode: any stop after boarding can be your stop.
+                // Otherwise any stop but this one switches the board to it.
                 Rectangle {
                   anchors.fill: parent
-                  visible: stopRow.pickable && stopPickArea.containsMouse
-                  color: Style.hoverFillFor(root.foreground, Color.accent)
+                  visible: stopRow.hovered
+                  color: Style.hoverFillFor(root.foreground, Commons.Color.accent)
                 }
                 MouseArea {
                   id: stopPickArea
                   anchors.fill: parent
-                  enabled: stopRow.pickable
+                  enabled: stopRow.pickable || stopRow.hoppable
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onClicked: root.startRide(root.selectedTrain, stopRow.modelData.stopId, stopRow.modelData.epoch)
+                  onClicked: {
+                    if (stopRow.pickable) root.startRide(root.selectedTrain, stopRow.modelData.stopId, stopRow.modelData.epoch)
+                    else root.goToStation(stopRow.modelData.stopId)
+                  }
+                }
+
+                Item {
+                  id: stopRail
+                  readonly property real cx: Style.space(10)
+                  width: Style.space(28)
+                  height: parent.height
+
+                  Rectangle {
+                    x: stopRail.cx - width / 2
+                    y: stopRow.index === 0 ? stopRow.height / 2 : 0
+                    width: Style.space(2)
+                    height: (stopRow.last ? stopRow.height / 2 : stopRow.height) - y
+                    color: Qt.alpha(root.foreground, 0.25)
+                  }
+                  Rectangle {
+                    visible: root.trainOnRail && stopRow.fillBottom > stopRow.fillTop
+                    x: stopRail.cx - width / 2
+                    y: (stopRow.fillTop - stopRow.index + 0.5) * stopRow.height
+                    width: Style.space(4)
+                    height: (stopRow.fillBottom - stopRow.fillTop) * stopRow.height
+                    radius: width / 2
+                    color: Commons.Color.accent
+                  }
+                  Rectangle {
+                    visible: !stopRow.modelData.isBoard
+                    width: Style.space(6)
+                    height: width
+                    radius: width / 2
+                    x: stopRail.cx - width / 2
+                    y: stopRow.height / 2 - height / 2
+                    color: root.trainOnRail && stopRow.index >= root.trainFillStart && stopRow.index <= Math.floor(root.trainRailPosition)
+                      ? Commons.Color.accent : Qt.darker(root.foreground, 2.2)
+                  }
+                  Rectangle {
+                    visible: stopRow.modelData.isBoard && !root.trainApproaching
+                    width: Style.space(10)
+                    height: width
+                    radius: width / 2
+                    x: stopRail.cx - width / 2
+                    y: stopRow.height / 2 - height / 2
+                    color: Commons.Color.accent
+                  }
+                  Canvas {
+                    id: arrivingArrow
+                    property color fill: Commons.Color.accent
+                    visible: stopRow.modelData.isBoard && root.trainApproaching
+                    width: Style.space(12)
+                    height: Style.space(10)
+                    x: stopRail.cx - width / 2
+                    y: stopRow.height / 2 - height / 2
+                    onFillChanged: requestPaint()
+                    onPaint: {
+                      var ctx = getContext("2d")
+                      ctx.reset()
+                      ctx.fillStyle = arrivingArrow.fill
+                      ctx.beginPath()
+                      ctx.moveTo(0, 0)
+                      ctx.lineTo(width, 0)
+                      ctx.lineTo(width / 2, height)
+                      ctx.closePath()
+                      ctx.fill()
+                    }
+                  }
+                  RoutePill {
+                    visible: stopRow.holdsTrain
+                    route: root.selectedTrain ? root.selectedTrain.route : ""
+                    diameter: Style.space(18)
+                    labelFontFamily: root.fontFamily
+                    labelPixelSize: Style.font.caption
+                    x: stopRail.cx - width / 2
+                    y: (root.trainRailTip - stopRow.index + 0.5) * stopRow.height - height / 2
+                  }
                 }
 
                 Text {
-                  id: boardMarker
-                  visible: stopRow.modelData.isBoard
-                  anchors.left: parent.left
-                  anchors.verticalCenter: parent.verticalCenter
                   textFormat: Text.PlainText
-                  text: "●"
-                  color: Color.accent
-                  font.pixelSize: Style.font.body
-                }
-
-                Text {
-                  textFormat: Text.PlainText
-                  anchors.left: boardMarker.visible ? boardMarker.right : parent.left
-                  anchors.leftMargin: boardMarker.visible ? Style.space(8) : 0
+                  anchors.left: stopRail.right
                   anchors.right: stopTimeText.left
                   anchors.rightMargin: Style.space(10)
                   anchors.verticalCenter: parent.verticalCenter
@@ -2604,22 +2799,33 @@ Panel {
                     }
                     return name
                   }
-                  color: stopRow.modelData.isContext ? root.dim : root.foreground
+                  color: stopRow.hovered && stopRow.hoppable ? Commons.Color.accent : (stopRow.dimmed ? root.dim : root.foreground)
                   font.family: root.fontFamily
-                  font.pixelSize: stopRow.modelData.isContext ? Style.font.bodySmall : Style.font.body
+                  font.pixelSize: stopRow.dimmed ? Style.font.bodySmall : Style.font.body
                   font.bold: stopRow.modelData.isBoard
                 }
 
-                Text {
+                Row {
                   id: stopTimeText
-                  textFormat: Text.PlainText
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
-                  visible: !stopRow.modelData.isContext
-                  text: Model.formatClockTime(stopRow.modelData.epoch)
-                  color: root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
+                  visible: !stopRow.modelData.isContext && !stopRow.modelData.passed
+
+                  Text {
+                    visible: stopRow.modelData.isBoard && root.trainApproaching
+                    textFormat: Text.PlainText
+                    text: Model.awayPhrase((stopRow.modelData.epoch - root.railNow) / 60)
+                    color: Commons.Color.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: (stopRow.modelData.isBoard && root.trainApproaching ? " · " : "") + Model.formatClockTime(stopRow.modelData.epoch)
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
                 }
 
                 Rectangle {
@@ -2661,13 +2867,13 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
             }
             IconTapText {
-              text: "✕"
+              text: root.backCloses ? "✕" : "⬅"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
-              onActivated: root.closeLines()
+              onActivated: root.goBack()
             }
           }
 
@@ -2730,7 +2936,7 @@ Panel {
                 Rectangle {
                   anchors.fill: parent
                   visible: lineRow.hasAlerts && lineArea.containsMouse
-                  color: Style.hoverFillFor(root.foreground, Color.accent)
+                  color: Style.hoverFillFor(root.foreground, Commons.Color.accent)
                 }
 
                 Column {
@@ -2859,13 +3065,13 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
             }
             IconTapText {
-              text: "✕"
+              text: root.backCloses ? "✕" : "⬅"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
-              onActivated: root.closeTripPlanner()
+              onActivated: root.goBack()
             }
           }
 
@@ -2884,7 +3090,7 @@ Panel {
             width: parent.width
             height: Style.space(50)
             radius: Style.cornerRadius
-            color: Style.normalFillFor(root.foreground, Color.accent)
+            color: Style.normalFillFor(root.foreground, Commons.Color.accent)
             border.width: 1
             border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
 
@@ -2904,7 +3110,7 @@ Panel {
               }
               Text {
                 textFormat: Text.PlainText
-                text: root.tripOrigin ? root.tripOrigin.name : "Choose a station"
+                text: root.tripOrigin ? Stations.displayName(root.tripOrigin) : "Choose a station"
                 color: root.tripOrigin ? root.foreground : root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -2926,7 +3132,7 @@ Panel {
             IconTapText {
               anchors.centerIn: parent
               text: "⇅"
-              color: (root.tripOrigin || root.tripDestination) ? Color.accent : root.dim
+              color: (root.tripOrigin || root.tripDestination) ? Commons.Color.accent : root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               hitMargin: Style.space(8)
@@ -2939,7 +3145,7 @@ Panel {
             width: parent.width
             height: Style.space(50)
             radius: Style.cornerRadius
-            color: Style.normalFillFor(root.foreground, Color.accent)
+            color: Style.normalFillFor(root.foreground, Commons.Color.accent)
             border.width: 1
             border.color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.15)
 
@@ -2959,7 +3165,7 @@ Panel {
               }
               Text {
                 textFormat: Text.PlainText
-                text: root.tripDestination ? root.tripDestination.name : "Choose a station"
+                text: root.tripDestination ? Stations.displayName(root.tripDestination) : "Choose a station"
                 color: root.tripDestination ? root.foreground : root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -3195,13 +3401,13 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
             }
             IconTapText {
-              text: "✕"
+              text: root.backCloses ? "✕" : "⬅"
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
-              onActivated: root.closePicker()
+              onActivated: root.goBack()
             }
           }
 
@@ -3210,7 +3416,7 @@ Panel {
             width: parent.width
             placeholderText: "Search stations by name…"
             foreground: root.foreground
-            accent: Color.accent
+            accent: Commons.Color.accent
             font.family: root.fontFamily
             // One-directional: this field is the source of truth for what's
             // typed. A live `text: root.pickerQuery` binding here would fight
@@ -3359,7 +3565,7 @@ Panel {
 
                   Text {
                     textFormat: Text.PlainText
-                    text: modelData.name
+                    text: Stations.displayName(stationRow.modelData)
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
@@ -3399,7 +3605,6 @@ Panel {
                         }
 
                         MouseArea {
-                          id: resultPillArea
                           anchors.fill: parent
                           // Only the "change tracked station" purpose cares
                           // which specific line's pill was tapped — disabled
